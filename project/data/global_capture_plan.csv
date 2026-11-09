@@ -1,0 +1,35 @@
+id,kind,target_present,distance_mm,pose,position,background,requirement
+P001,positive,true,700,yaw_0,center,normal,0.70m side center
+P002,positive,true,700,yaw_+30,left,normal,0.70m yaw +30 left
+P003,positive,true,700,yaw_-30,right,normal,0.70m yaw -30 right
+P004,positive,true,700,yaw_+60,center,normal,0.70m yaw +60 center
+P005,positive,true,700,yaw_-60,center,normal,0.70m yaw -60 center
+P006,positive,true,700,yaw_+75,left,normal,0.70m near end +75 left
+P007,positive,true,700,yaw_-75,right,normal,0.70m near end -75 right
+P008,positive,true,700,yaw_180,center,normal,0.70m reverse ends center
+P009,positive,true,850,yaw_0,center,normal,0.85m side center
+P010,positive,true,850,yaw_+30,left,normal,0.85m yaw +30 left
+P011,positive,true,850,yaw_-30,right,normal,0.85m yaw -30 right
+P012,positive,true,850,yaw_+60,center,normal,0.85m yaw +60 center
+P013,positive,true,850,yaw_-60,center,normal,0.85m yaw -60 center
+P014,positive,true,850,yaw_+75,left,normal,0.85m near end +75 left
+P015,positive,true,850,yaw_-75,right,normal,0.85m near end -75 right
+P016,positive,true,850,yaw_180,center,normal,0.85m reverse ends center
+P017,positive,true,1000,yaw_0,center,normal,1.00m side center
+P018,positive,true,1000,yaw_+30,left,normal,1.00m yaw +30 left
+P019,positive,true,1000,yaw_-30,right,normal,1.00m yaw -30 right
+P020,positive,true,1000,yaw_+60,center,normal,1.00m yaw +60 center
+P021,positive,true,1000,yaw_-60,center,normal,1.00m yaw -60 center
+P022,positive,true,1000,yaw_+75,left,normal,1.00m near end +75 left
+P023,positive,true,1000,yaw_-75,right,normal,1.00m near end -75 right
+P024,positive,true,1000,yaw_180,center,normal,1.00m reverse ends center
+P025,positive,true,700,pitch_+15,center,support,0.70m lift one end 15deg
+P026,positive,true,850,pitch_-30,center,support,0.85m lift other end 30deg
+P027,positive,true,850,roll_+60,center,support,0.85m roll long axis 60deg
+N001,negative,false,700,empty,center,normal,0.70m empty table
+N002,negative,false,850,empty,center,alternate,0.85m empty alt scene
+N003,negative,false,850,distractor,center,normal,0.85m similar object only
+N004,negative,false,700,distractor,left,clutter,0.70m similar object clutter
+N005,negative,true,850,half_occluded,center,normal,0.85m target half occluded
+N006,negative,true,550,out_of_range,center,normal,0.55m target too close
+N007,negative,true,1100,out_of_range,center,normal,1.10m far boundary

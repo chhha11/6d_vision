@@ -1,0 +1,13 @@
+# Python dependencies for Ubuntu 22.04. Keep the Orbbec SDK in the native
+# backend; do not install the Windows OpenNI wheel from sdk/.
+numpy
+scipy
+opencv-contrib-python
+av
+open3d
+trimesh
+torch
+ultralytics
+matplotlib
+pyyaml
+

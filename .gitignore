@@ -1,0 +1,57 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local credentials and editor settings
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+.vscode/
+.idea/
+.DS_Store
+*~
+
+# Native build outputs
+/build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.so.*
+/tools/orbbec_multistream_probe
+
+# Downloaded SDK and third-party dependencies
+/OrbbecSDK_*/
+/third_party/3DObjectTracking/
+/third_party/m3t_deps/
+
+# Capture data, training outputs, and runtime artifacts
+/data/
+/runs/
+/Log/
+/logs/
+*.log
+/project/data/cache/
+/project/data/runs/
+/project/data/samples/
+/project/data/tracking/
+/project/data/rgbd_capture/
+/project/data/tmp/
+
+# Keep calibration parameters; omit raw calibration captures
+/project/data/calibration/images/
+/project/data/calibration/validation_images/
+/project/data/calibration/rgb_ir_pairs/
+/project/data/calibration/rgb_ir_probe/
+/project/data/calibration/rgb_ir_validation/

@@ -1,0 +1,6 @@
+# Treat CAD geometry and binary reference data as opaque assets.
+*.stl binary
+*.stp binary
+*.step binary
+*.npz binary
+*.png binary

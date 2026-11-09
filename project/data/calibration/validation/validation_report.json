@@ -1,0 +1,42 @@
+{
+  "intrinsics": "D:\\new_6d_vision\\calibration\\camera_intrinsics.npz",
+  "intrinsics_refitted": false,
+  "method": "Fixed K/dist. Per-image pose fit; interleaved half-corner pose fit and remaining-corner score.",
+  "detected_images": 5,
+  "total_images": 5,
+  "aggregate_rms_px": 0.516666312481153,
+  "held_out_corners_rms_px": 0.548112434451468,
+  "limitations": "Image reprojection consistency only; not an independent metric position accuracy measurement.",
+  "views": [
+    {
+      "file": "frame_20261029_153212_397222.png",
+      "detected": true,
+      "pose_fit_rms_px": 0.33709585666656494,
+      "held_out_corners_rms_px": 0.3441215455532074
+    },
+    {
+      "file": "frame_20261029_153215_338691.png",
+      "detected": true,
+      "pose_fit_rms_px": 0.34294450283050537,
+      "held_out_corners_rms_px": 0.3509516716003418
+    },
+    {
+      "file": "frame_20261029_153234_956689.png",
+      "detected": true,
+      "pose_fit_rms_px": 0.5433531999588013,
+      "held_out_corners_rms_px": 0.5512229204177856
+    },
+    {
+      "file": "frame_20261029_153242_722260.png",
+      "detected": true,
+      "pose_fit_rms_px": 0.7115990519523621,
+      "held_out_corners_rms_px": 0.7786425948143005
+    },
+    {
+      "file": "frame_20261029_153252_220004.png",
+      "detected": true,
+      "pose_fit_rms_px": 0.5494269132614136,
+      "held_out_corners_rms_px": 0.5919615626335144
+    }
+  ]
+}
