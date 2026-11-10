@@ -42,27 +42,39 @@ def advance_box(source, current, box, *, corners=None):
     points = cv2.goodFeaturesToTrack(first, 100, .01, 5, mask=mask)
     if points is None or len(points) < 10:
         return None
-    forward, valid, _ = cv2.calcOpticalFlowPyrLK(
-        first, second, points, None, winSize=(31, 31), maxLevel=3)
-    if forward is None or valid is None or not np.isfinite(forward).all():
-        return None
-    backward, back_valid, _ = cv2.calcOpticalFlowPyrLK(
-        second, first, forward, None, winSize=(31, 31), maxLevel=3)
-    if backward is None or back_valid is None:
-        return None
-    good = (valid.ravel().astype(bool) & back_valid.ravel().astype(bool) &
-            (np.linalg.norm(backward - points, axis=2).ravel() <= 1.))
-    if np.count_nonzero(good) < 10:
-        return None
-    origin, target = points[good, 0], forward[good, 0]
-    matrix, inliers = cv2.estimateAffinePartial2D(
-        origin, target, method=cv2.RANSAC, ransacReprojThreshold=2.)
-    if matrix is None or inliers is None:
-        return None
-    keep = inliers.ravel().astype(bool)
-    spread = cv2.contourArea(cv2.convexHull(origin[keep])) if keep.sum() >= 3 else 0.
-    if (keep.sum() < 10 or keep.mean() < .65 or
-            spread < max(100., (x2-x1)*(y2-y1)*.08)):
+    matrix = inliers = origin = None
+    # Keep the precise path for normal motion. The second path is only a
+    # recovery attempt for blur or a larger inter-frame displacement.
+    for win_size, max_level, fb_limit, ransac_limit, min_ratio in (
+            ((31, 31), 3, 1., 2., .65),
+            ((41, 41), 4, 1.5, 2.5, .55)):
+        forward, valid, _ = cv2.calcOpticalFlowPyrLK(
+            first, second, points, None, winSize=win_size, maxLevel=max_level)
+        if forward is None or valid is None or not np.isfinite(forward).all():
+            continue
+        backward, back_valid, _ = cv2.calcOpticalFlowPyrLK(
+            second, first, forward, None, winSize=win_size, maxLevel=max_level)
+        if backward is None or back_valid is None:
+            continue
+        good = (valid.ravel().astype(bool) & back_valid.ravel().astype(bool) &
+                (np.linalg.norm(backward - points, axis=2).ravel() <= fb_limit))
+        if np.count_nonzero(good) < 10:
+            continue
+        origin, target = points[good, 0], forward[good, 0]
+        candidate, candidate_inliers = cv2.estimateAffinePartial2D(
+            origin, target, method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_limit)
+        if candidate is None or candidate_inliers is None:
+            continue
+        keep = candidate_inliers.ravel().astype(bool)
+        spread = (cv2.contourArea(cv2.convexHull(origin[keep]))
+                  if keep.sum() >= 3 else 0.)
+        if (keep.sum() < 10 or keep.mean() < min_ratio or
+                spread < max(100., (x2-x1)*(y2-y1)*.08)):
+            continue
+        matrix, inliers = candidate, candidate_inliers
+        break
+    if matrix is None or inliers is None or origin is None:
         return None
     scale = np.linalg.norm(matrix[0, :2])
     if not .65 <= scale <= 1.5:

@@ -28,6 +28,64 @@ def restore_diagonal_box(box, inverse, shape):
     return np.clip(bounds, [0, 0, 0, 0], [width, height, width, height]).astype(np.float32)
 
 
+def _box_iou(first, second):
+    first = np.asarray(first, np.float64).reshape(4)
+    second = np.asarray(second, np.float64).reshape(4)
+    intersection = np.maximum(
+        np.minimum(first[2:], second[2:]) - np.maximum(first[:2], second[:2]), 0.)
+    intersection_area = float(np.prod(intersection))
+    first_area = float(np.prod(np.maximum(first[2:] - first[:2], 0.)))
+    second_area = float(np.prod(np.maximum(second[2:] - second[:2], 0.)))
+    return intersection_area / max(first_area + second_area - intersection_area, 1e-6)
+
+
+def fuse_view_candidates(candidates, *, min_iou=.65, max_area_ratio=1.8):
+    """Fuse repeated multi-view boxes before association.
+
+    Rotating the same image changes the detector's axis-aligned rectangle even
+    when the physical object is static.  Keeping the highest-confidence box
+    makes that rectangle jump whenever the winning view changes.  This small
+    weighted box fusion uses only strongly overlapping, similarly sized
+    candidates; distinct nearby objects remain separate under the existing NMS
+    threshold.
+
+    ``candidates`` contains ``(confidence, xyxy)`` pairs and the result keeps
+    the same confidence-ordered list shape.
+    """
+    clusters = []
+    for score, box in sorted(candidates, key=lambda item: float(item[0]), reverse=True):
+        box = np.asarray(box, np.float32).reshape(4)
+        if not np.isfinite(box).all():
+            continue
+        area = float(np.prod(np.maximum(box[2:] - box[:2], 0.)))
+        selected = None
+        for cluster in clusters:
+            cluster_box = cluster['box']
+            cluster_area = cluster['area']
+            ratio = max(area, cluster_area) / max(min(area, cluster_area), 1e-6)
+            if ratio <= max_area_ratio and _box_iou(box, cluster_box) >= min_iou:
+                selected = cluster
+                break
+        weight = max(float(score), .05) ** 2
+        if selected is None:
+            clusters.append(dict(box=box.copy(), area=area, weight=weight,
+                                 score=float(score), members=1))
+            continue
+        if np.max(np.abs(selected['box'] - box)) <= 1e-5:
+            selected['score'] = max(selected['score'], float(score))
+            selected['members'] += 1
+            continue
+        selected['box'] = ((selected['box'] * selected['weight'] + box * weight) /
+                           (selected['weight'] + weight)).astype(np.float32)
+        selected['area'] = float(np.prod(np.maximum(
+            selected['box'][2:] - selected['box'][:2], 0.)))
+        selected['weight'] += weight
+        selected['score'] = max(selected['score'], float(score))
+        selected['members'] += 1
+    return [(cluster['score'], cluster['box']) for cluster in
+            sorted(clusters, key=lambda item: item['score'], reverse=True)]
+
+
 def detect_target_boxes(detector, frame, fallback_rotation=2, *, progressive=False):
     """Return confidence-ordered boxes in camera coordinates, with cross-view NMS.
 
@@ -70,7 +128,8 @@ def detect_target_boxes(detector, frame, fallback_rotation=2, *, progressive=Fal
             if np.isfinite(score) and plausible_target_box(box, frame.shape):
                 candidates.append((score, box))
     kept = []
-    for _, box in sorted(candidates, key=lambda item: item[0], reverse=True):
+    fused = fuse_view_candidates(candidates)
+    for _, box in fused:
         if all(box_overlap(box, previous)[0] < .5 for previous in kept):
             kept.append(box)
     return kept

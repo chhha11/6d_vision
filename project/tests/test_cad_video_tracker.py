@@ -373,7 +373,7 @@ class CadBoxDisplayTest(unittest.TestCase):
         np.testing.assert_array_equal(baseline[:-9], shifted[9:])
         self.assertFalse(shifted[:9].any())
 
-    def test_side_pose_uses_unshifted_box_by_default(self):
+    def test_side_pose_uses_saved_display_offset_by_default(self):
         corners = tracker.load_model_box(tracker.DEFAULT_MODEL)
         K = np.array([[400, 0, 160], [0, 400, 120], [0, 0, 1]], np.float64)
         # A horizontal/side-mounted pose makes a fixed screen Y compensation
@@ -382,9 +382,10 @@ class CadBoxDisplayTest(unittest.TestCase):
         tvec = np.array([18.2794577, -3.0712642, 514.3849136])
         default = tracker.render_box_layer(
             (240, 320, 3), corners, K, np.zeros(5), rvec, tvec)
-        unshifted = tracker.render_box_layer(
-            (240, 320, 3), corners, K, np.zeros(5), rvec, tvec, 0)
-        np.testing.assert_array_equal(default, unshifted)
+        shifted = tracker.render_box_layer(
+            (240, 320, 3), corners, K, np.zeros(5), rvec, tvec,
+            tracker.BOX_DISPLAY_Y_OFFSET_PX)
+        np.testing.assert_array_equal(default, shifted)
 
     def test_live_box_uses_measured_roll_instead_of_a_level_surrogate(self):
         corners = tracker.load_model_box(tracker.DEFAULT_MODEL)

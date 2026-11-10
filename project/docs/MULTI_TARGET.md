@@ -1,9 +1,9 @@
 # 同一画面内识别多个能量单元
 
 多目标模式使用已有能量单元 YOLO 权重，同一帧保留所有通过几何检查的检测框。
-预览仅显示通过位姿验证的目标的 CAD 边缘轮廓和坐标轴，轮廓跟随各自的 6DoF 位姿。
+预览只显示已经通过 6DoF 验证的目标 CAD 边缘轮廓和坐标轴；尚未取得 6DoF 的二维检测候选不绘制任何框。轮廓直接跟随各自当前有效的 6DoF 位姿；静止时不会用背景边缘二次平移轮廓。
 不同目标用不同颜色的轮廓区分，颜色由跟踪编号确定，不随检测顺序改变；坐标轴保持原有 XYZ 配色。
-未取得有效位姿时不绘制轮廓。短暂位姿失败时，仅在光流仍支持目标且目标基本静止时限时保留轮廓；不会切换到二维矩形框。预览不叠加目标标签或数量文字，编号和数量仍写入日志。
+未取得有效位姿时不绘制轮廓。当前测量短暂失败时，如果框光流仍有可靠支持，会进入最多 3 帧的 `pose_predicted` 状态；该状态只用于连续显示和等待重新测量，不刷新测量时间。预览不叠加目标标签或数量文字，编号和数量仍写入日志。
 已按同屏 4–6 个目标补充测试，代码没有将数量限制为两个。
 默认仍为原有单目标模式；使用 `--multi-target` 开启新模式。
 
@@ -14,12 +14,18 @@ cd /home/chhha/6d_vision/project
 ../.venv/bin/python -m core.live_depth_6dof --multi-target
 ```
 
-按空格或 S 开始，Q 或 Esc 退出。需要直接启动时加 `--no-manual-start`。
+摄像头模式默认先显示原图并等待按空格或 S；画面左上角会显示操作提示。需要直接启动检测时加 `--no-manual-start`。按 Q 或 Esc 退出。
 相机选择继续使用 `--camera` 或 `--camera-name`。
 多目标与单目标模式都默认开启 `--cad-outline`，关闭额外的长方体包围框。
 多目标模式不绘制长方体框，即使传入 `--show-box`；该开关仅作用于单目标模式。
 使用 `--no-cad-outline` 可关闭 CAD 边缘轮廓，`--no-pose-axes` 可关闭坐标轴。
+默认关闭基于图像边缘的显示层平移校正；如需做对照实验，可显式加 `--display-edge-correction`，它只改变预览，不改变 6DoF 输出。
 这些显示开关不影响位姿计算和输出。
+
+静止偏移复测时，显式使用 `--no-display-edge-correction --box-display-y-offset-px 8`，
+保持相机和目标静止 10–20 秒后按 Q 退出，保留该次输出目录中的原始录像与 `multi_targets.jsonl`。
+机械臂使用的 metric 位姿始终保留完整旋转；预览轮廓使用 metric 位姿，坐标轴显示会根据上一帧解开近似对称目标的长轴符号，避免坐标轴在等价 PnP 分支间来回反向。这只改变显示层，不改变日志和机械臂输出。
+这消除了显示与位姿不一致的来源，但不代表 PnP 误差已经消除；若仍偏移，需用原始画面和同步位姿继续检查参考图对应点、相机内参及 CAD 几何。
 
 只需要记录检测结果、编号和数量，不计算位姿时（预览显示原始画面，不叠加检测框）：
 
@@ -31,19 +37,26 @@ cd /home/chhha/6d_vision/project
 离线视频可以直接输入，不需要单目标深度初始化样本：
 
 ```bash
+VIDEO=/absolute/path/to/your/real_test_video.mp4
 ../.venv/bin/python -m core.live_depth_6dof \
-  --multi-target --video /absolute/path/to/video.avi \
+  --multi-target --video "$VIDEO" \
   --headless --no-rgb-first --output-dir /tmp/energy_multi_result
 ```
+
+`/absolute/path/to/your/real_test_video.mp4` 只是占位示例，不能直接照抄。先用
+`find ~/Videos ~/Downloads /tmp -type f \( -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mov' \)`
+查找真实文件，再把 `VIDEO` 替换为该文件的绝对路径。若当前是摄像头和物体相对移动测试，
+不要传 `--video`，直接使用上面的摄像头启动命令。
 
 `--max-frames N` 限制处理帧数。`--headless` 仅用于多目标模式。
 多目标模式要求检测模型存在，可通过 `--reacquire-model /path/to/best.pt` 指定。
 
 ## 识别和位姿
 
-- 原图、原有旋转补检，以及 ±30°、±45°、±60° 倾斜补检都会运行（默认共八个视图），避免找到直立目标后漏掉其他倾斜目标。倾斜视图保留原始像素尺度，逆变换四个角点后得到相机图像中的候选框；先检查源图框是否合法，再跨视图按置信度排序去重。旋转后仍可能产生额外的二维候选框，只有通过独立位姿验证的目标才绘制轮廓。
+- 原图、原有旋转补检，以及 ±30°、±45°、±60° 倾斜补检都会运行（默认共八个视图），避免找到直立目标后漏掉其他倾斜目标。倾斜视图保留原始像素尺度，逆变换四个角点后得到相机图像中的候选框；先检查源图框是否合法，再对高 IoU、相近尺寸的同目标候选做置信度加权融合，最后跨视图按 IoU 去重。这样不会因为某一帧恰好由另一旋转视图取得最高置信度而让框整体跳动。旋转后仍可能产生额外的二维候选框，只有通过独立位姿验证的目标才绘制轮廓。
 - 相邻帧用光流预测框位置，再通过一对一匹配维护编号。已有位姿的目标在检测漏检时，只要最近一次测量距当前不超过 0.3 秒且没有关联冲突，就继续尝试当前帧的光流/PnP；连续测量成功可以持续跟踪，不受六帧检测间隙限制。缺少当前位姿测量时，框光流延续仍限制为 0.3 秒和 6 帧；光流和显示保留不会刷新检测时间或测量时间。尺寸、长宽比明显不符的检测候选不会抢占已建立的位姿轨迹。缺失目标一秒内位置仍能匹配时可保留编号，超时退出后再次进入会分配新编号。
-- 单次位姿跟踪失败后，恢复从上次成功位姿所对应的原始帧重试，避免用错误帧的特征坐标。仅当光流成功、框各坐标位移不超过 4 像素、旧位姿仍符合当前检测框时，显示最多保留 0.25 秒且不超过 6 个新帧。明显移动、证据冲突或超时会隐藏轮廓和坐标轴。保留显示不算当前帧有效位姿，也不输出旧的三维测量值。
+- 目标内部把原始检测框、光流预测框、滤波关联框和 CAD 投影框分开保存。对尚未建立 6DoF 位姿的目标，检测测量与当前帧光流预测会做有界融合；原始检测框用于姿态和检测一致性校验，滤波框用于关联，`pose_projection_box` 用于记录当前 CAD 投影边界。这样二维检测的尺寸跳动不会覆盖已建立的位姿，CAD 投影也不会反过来污染下一帧的检测关联。
+- 单次位姿跟踪失败后，先从上次成功位姿所对应的原始帧重试，避免用错误帧的特征坐标。若当前帧的框光流通过几何检查，则可用上一测量的平移和表观尺度生成最多 3 帧的 `pose_predicted`，只作为短时预测；预测不刷新 `pose_timestamp`，也不会伪装成新的精确测量。超过预测预算、证据冲突或恢复超时后隐藏轮廓和坐标轴。
 - 编号用于当前会话的图像关联。相同外观目标完全遮挡、交叉或快速移动后，不能保证物理身份保持不变。
 - 默认分别尝试每个目标的 RGB/CAD 参考位姿。每个目标有独立的时序特征和位姿状态；后台在普通轮询和已建立轨迹的恢复搜索之间交替分配任务，各自使用独立游标，避免新目标或恢复目标饥饿。
 - 在刚通过验证的位姿上，从 CAD 可见表面补充真实图像角点，保留原有对应点并去除近邻重复点，总数上限 120。参考初始化后补充一次，之后每 20 个跟踪帧补充；少于 50 点时最短间隔为 5 帧。新增点只用于后续帧跟踪，不增加当前测量的独立参考支持数，不在旧位姿保留期间补点；原有光流/PnP 验证门限保持不变。
@@ -59,13 +72,13 @@ cd /home/chhha/6d_vision/project
 - `frame`：从零开始的帧序号；`elapsed_s`：程序运行时间；`source_elapsed_s`：视频的采集时间（有相邻元数据时采用其时间戳，否则采用帧序号/FPS；FPS 无效时回退为 30）。离线跟踪超时按采集时间计算，避免推理耗时改变视频运动的时间尺度。相机模式仍使用单调时钟。
 - `count`：该帧关联到的目标数（包含未绘制轮廓的二维检测）；`pose_verified_count`：其中具有有效位姿和三维投影的目标数。
 - `display_count`：具有可用显示位姿和投影的目标数（包括短时保留）；`held_count`：其中短时保留显示的目标数。这些字段不表示每帧重新测得的位姿数量，也不受显示开关影响。
-- `targets`：各目标的 `id`、像素坐标 `box_xyxy`、`state`、`rvec`、`tvec_mm`。
-- 目标的布尔字段 `detected` 表示本次关联是否匹配到检测器返回的框；`false` 表示由位姿跟踪或短时框光流延续。`display_visible` 表示存在可用显示投影；`display_held` 表示暂用上次有效位姿显示。保留显示时当前 `rvec`、`tvec_mm` 和三维角点仍为 `null`。
-- `box_xyxy` 在测量成功后更新为当前 CAD 投影的边界，未测量时来自检测或框光流预测。
-- `tracking_points`：当前位姿携带的跟踪点数量，包含新增表面点，不等于当前 PnP 的独立参考内点数。`tracking_failure`：最近跟踪失败原因（`flow_or_pnp`、`detector_conflict`、`recovery_expired`），成功测量后清空。
-- `state` 为 `detected` 或 `pose_verified`；未经位姿验证的目标，其 `rvec`、`tvec_mm` 为 `null`。
+- `targets`：各目标的 `id`、像素坐标 `box_xyxy`、`state`、`rvec`、`tvec_mm`。其中 `raw_detection_box_xyxy` 是检测器当前测量，`predicted_box_xyxy` 是光流预测，`filtered_box_xyxy` 和 `association_box_xyxy` 是用于关联的滤波框，`cad_box_xyxy` 是当前姿态重新投影得到的 CAD 边界，`box_source` 说明关联框来源。
+- 目标的布尔字段 `detected` 表示本次关联是否匹配到检测器返回的框；`false` 表示由位姿跟踪或框光流延续。`display_visible` 表示存在可用显示投影；`display_held` 表示暂用上次有效位姿显示。`state` 为 `detected`、`pose_verified` 或 `pose_predicted`；预测状态保留当前预测的 `rvec`、`tvec_mm`，但 `pose_timestamp` 仍指向最近一次真实测量，并额外写入 `pose_prediction_timestamp` 和 `pose_age_frames`。
+- `box_xyxy` 兼容保留为关联框；CAD 投影使用 `cad_box_xyxy` 单独记录。这样可以分别计算检测框、关联框和模型投影框的中心误差与 IoU。
+- `tracking_points`：当前位姿携带的跟踪点数量，包含新增表面点，不等于当前 PnP 的独立参考内点数。`pose_rms_px`、`pose_inlier_ratio`、`pose_reference_support` 是最近一次真实 PnP 测量的诊断值；`pose_predicted` 状态下它们不会被当作当前帧的新测量。`tracking_failure`：最近跟踪失败原因（`flow_or_pnp`、`detector_conflict`、`recovery_expired`），成功测量后清空。
 - `box_corners_camera_mm`：三维包围框的 8 个角点在相机坐标系中的坐标（毫米）；`box_corners_image_px`：对应的 8 个图像投影点（像素）。没有有效三维投影时均为 `null`。
 - `rvec` 是 CAD 到相机坐标系的 Rodrigues 旋转向量，单位为弧度；`tvec_mm` 是相机坐标系下的平移，单位为毫米。
+- 当前阶段所有有效 6DoF 输出都明确标记为 `pose_frame: "camera"`，`pose_timestamp` 为对应图像时间戳，`ego_motion_source: "identity"` 表示尚未接入小车自运动。未来接入轮速、IMU、视觉里程计或 SLAM 时，只需替换时间戳自运动提供器，再增加相机坐标系到小车/机械臂坐标系的变换。
 - `pose_error`：参考加载/搜索错误或标定尺寸错误；无错误时为 `null`。
 
 多目标入口记录上述 JSONL，不生成原单目标跟踪器的录像和诊断格式。
@@ -73,7 +86,7 @@ cd /home/chhha/6d_vision/project
 ## 验证
 
 ```bash
-../.venv/bin/python -m unittest tests.test_multi_target tests.test_multi_target_6dof tests.test_multi_target_stability tests.test_multi_target_motion tests.test_detector_process
+../.venv/bin/python -m unittest tests.test_ego_motion tests.test_multi_target tests.test_multi_target_6dof tests.test_multi_target_stability tests.test_multi_target_motion tests.test_detector_process
 ```
 
 测试覆盖多检测框、不同朝向补检、重复框过滤、异步多框传播/过期、一对一关联、
@@ -193,7 +206,7 @@ RGB 参考匹配/PnP 模块，六个目标均通过位姿验证并显示独立�
 
 - 在当前位姿验证成功后，特征少于 30 个、相比上一测量减少超过 30%，或相对上次补点旋转达到 8° 时立即补点；保留每 20 帧补点、满 5 帧且少于 50 点时补点的规则。新点来自当前可见 CAD 表面，保留原有对应点并去重。
 - 检测关联分两轮进行：先匹配已有测量位姿的轨迹，再匹配其余候选，每轮保持一对一。避免侧倾改变轮廓后，重复二维候选抢走有效轨迹的检测。
-- 多目标光流跟踪遇到近似平面的三维特征时，使用当前对应点独立执行 ITERATIVE PnP；其他情况先用原 EPNP，失败后尝试 ITERATIVE。没有使用上一帧姿态作为求解初值，原有点数、光流往返误差、重投影误差及几何门限保持不变。单目标默认路径不启用此策略。
+- 多目标光流跟踪遇到近似平面的三维特征时，使用当前对应点执行带上一帧姿态初值的 ITERATIVE PnP；失败后才回退到 EPNP。历史版本曾没有传入上一帧姿态，容易在细长或近似对称目标上切换到 180° 等价分支。当前还用有向长轴连续性门限拒绝该分支，并把点光流测得的关联框位移与 CAD 投影框分开保存。单目标默认路径不启用此策略。
 
 使用真实手持侧倾录像 `live_depth_6dof/20261107_154403/attempt_003`，通过完整多目标入口对比；两版均使用采集时间：
 

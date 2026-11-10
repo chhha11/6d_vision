@@ -14,6 +14,8 @@ from core.multi_target_live import (IndependentPoses, TargetSet, lock_long_axis_
                                     target_record)
 from core.multi_target_tracking import replenish_pose
 from core.rgb_global_initializer import solve_correspondences
+from core.rgb_pose_recovery import (directed_long_axis_jump_deg,
+                                    pose_has_continuous_long_axis)
 from scipy.spatial.transform import Rotation
 
 
@@ -75,6 +77,22 @@ class MultiTargetMotionTest(unittest.TestCase):
         np.testing.assert_allclose(displayed_rotation.as_matrix(),
                                    base_rotation.as_matrix(), atol=1e-10)
 
+    def test_directed_long_axis_gate_rejects_the_opposite_pnp_branch(self):
+        # The object is viewed broadside, so a 180-degree branch produces the
+        # same elongated silhouette while reversing the model +Z direction.
+        base_rotation = Rotation.from_euler('y', 90., degrees=True)
+        opposite_rotation = base_rotation * Rotation.from_euler('x', 180., degrees=True)
+        tvec = np.array([0., 0., 600.])
+        jump = directed_long_axis_jump_deg(
+            base_rotation.as_rotvec(), tvec,
+            opposite_rotation.as_rotvec(), tvec, self.K, self.dist)
+
+        self.assertAlmostEqual(jump, 180., delta=1e-6)
+        self.assertFalse(pose_has_continuous_long_axis(
+            replace(self.pose, rvec=base_rotation.as_rotvec(), tvec=tvec),
+            replace(self.pose, rvec=opposite_rotation.as_rotvec(), tvec=tvec),
+            self.K, self.dist))
+
     def test_display_pose_does_not_reintroduce_accumulated_roll(self):
         base_rotation = Rotation.from_rotvec(self.pose.rvec.reshape(3))
         first_measured_rotation = (base_rotation *
@@ -135,6 +153,32 @@ class MultiTargetMotionTest(unittest.TestCase):
             self.assertIsNone(target.display_pose)
             self.assertIsNone(target_record(target, self.initializer)['tvec_mm'])
             self.assertEqual(tracker.update(blank, [], 11.08), [])
+
+    def test_update_rejects_opposite_long_axis_branch_and_keeps_last_good_pose(self):
+        tracker = TargetSet()
+        target = tracker.update(self.source, [self.box], 10.)[0]
+        base_rotation = Rotation.from_euler('y', 90., degrees=True)
+        base_pose = replace(self.pose, rvec=base_rotation.as_rotvec(),
+                            tvec=np.array([0., 0., 600.]))
+        target.pose = target.last_good_pose = base_pose
+        target.pose_source, target.pose_box, target.pose_time = (
+            self.source, self.box.copy(), 10.)
+        opposite_rotation = base_rotation * Rotation.from_euler('x', 180., degrees=True)
+        opposite = replace(base_pose, rvec=opposite_rotation.as_rotvec())
+        shifted = cv2.warpAffine(self.source,
+                                 np.array([[1., 0., 2.], [0., 1., 1.]]),
+                                 (640, 480))
+        service = IndependentPoses(lambda: self.initializer)
+        service.loading.result(timeout=2)
+        self.addCleanup(service.close)
+        with patch('core.rgb_global_initializer.advance_pose', return_value=opposite), \
+                patch('core.multi_target_live.detection_matches_pose', return_value=True):
+            service.update([target], shifted, schedule=False, timestamp=10.03)
+        self.assertIsNone(target.pose)
+        self.assertIs(target.last_good_pose, base_pose)
+        self.assertEqual(target.tracking_failure, 'long_axis_branch')
+        self.assertAlmostEqual(target.long_axis_jump_deg, 180., delta=1e-6)
+        self.assertEqual(service.stats['long_axis_branch'], 1)
 
     def test_temporal_pose_update_keeps_last_measured_box_as_geometry_guard(self):
         tracker = TargetSet()

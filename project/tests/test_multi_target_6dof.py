@@ -72,6 +72,14 @@ class MultiTarget6DofTest(unittest.TestCase):
         for color in colors:
             self.assertTrue(np.any(np.all(canvas == color, axis=2)))
 
+    def test_unverified_detection_is_hidden_before_pose(self):
+        target = Target(1, np.array([120., 80., 240., 300.]), 0.)
+        with patch('core.multi_target_live.cv2.rectangle') as rectangles:
+            canvas = draw_targets(self.frame, [target], self.initializer,
+                                  show_axes=False, outline_seeder=self.seeder)
+        rectangles.assert_not_called()
+        np.testing.assert_array_equal(canvas, self.frame)
+
     def test_contour_draw_deduplicates_broad_and_compact_tracks(self):
         compact = self.targets[0]
         width, height = compact.box[2:] - compact.box[:2]
@@ -96,10 +104,11 @@ class MultiTarget6DofTest(unittest.TestCase):
                          show_axes=False, outline_seeder=self.seeder)
         render.assert_called_once()
 
-    def test_loss_of_one_pose_hides_only_its_contour_without_fallback_box(self):
+    def test_loss_of_one_pose_hides_contour_and_detection_box(self):
         before = draw_targets(self.frame, self.targets, self.initializer,
                               show_axes=False, outline_seeder=self.seeder)
         self.targets[2].pose = None
+        self.targets[2].display_pose = None
         with patch('core.multi_target_live.cv2.rectangle') as rectangles:
             after = draw_targets(self.frame, self.targets, self.initializer,
                                  show_axes=False, outline_seeder=self.seeder)
@@ -141,7 +150,8 @@ class MultiTarget6DofTest(unittest.TestCase):
         with patch('core.multi_target_live.estimate_display_affine',
                    return_value=candidate):
             draw_targets(self.frame, [target], self.initializer,
-                         show_axes=False, outline_seeder=self.seeder)
+                         show_axes=False, outline_seeder=self.seeder,
+                         display_edge_correction=True)
         self.assertIsNone(target.display_affine)
         self.assertEqual(target.display_candidate_hits, 1)
 
@@ -149,7 +159,8 @@ class MultiTarget6DofTest(unittest.TestCase):
         with patch('core.multi_target_live.estimate_display_affine',
                    return_value=candidate):
             draw_targets(self.frame, [target], self.initializer,
-                         show_axes=False, outline_seeder=self.seeder)
+                         show_axes=False, outline_seeder=self.seeder,
+                         display_edge_correction=True)
         np.testing.assert_allclose(target.display_affine, candidate)
         self.assertEqual(target.display_candidate_hits, 0)
 
@@ -163,11 +174,67 @@ class MultiTarget6DofTest(unittest.TestCase):
         with patch('core.multi_target_live.estimate_display_affine',
                    return_value=outlier):
             draw_targets(self.frame, [target], self.initializer,
-                         show_axes=False, outline_seeder=self.seeder)
+                         show_axes=False, outline_seeder=self.seeder,
+                         display_edge_correction=True)
         np.testing.assert_array_equal(target.display_affine, locked)
         self.assertEqual(target.display_candidate_hits, 1)
 
+    def test_live_contour_disables_edge_correction_by_default(self):
+        target = self.targets[0]
+        # Strong unrelated lines remain stationary and would pass temporal
+        # consensus just as easily as true object edges.
+        frame = self.frame.copy()
+        cv2.line(frame, (0, 180), (639, 180), (255, 255, 255), 3)
+        cv2.line(frame, (200, 0), (200, 479), (255, 255, 255), 3)
+        expected = draw_targets(frame, [target], self.initializer,
+                                show_axes=True, outline_seeder=self.seeder)
+        stale = np.array([[1., 0., 18.], [0., 1., -12.]], np.float32)
+        target.display_affine = stale.copy()
+        target.display_candidate_affine = stale.copy()
+        target.display_candidate_hits = 2
+        with patch('core.multi_target_live.estimate_display_affine',
+                   return_value=stale) as estimate:
+            for tick in (0, 8, 24, 48, 96):
+                target.tracked_frames = tick
+                actual = draw_targets(frame, [target], self.initializer,
+                                      show_axes=True, outline_seeder=self.seeder)
+                np.testing.assert_array_equal(actual, expected)
+        estimate.assert_not_called()
+        self.assertIsNone(target.display_affine)
+        self.assertIsNone(target.display_candidate_affine)
+
+    def test_live_contour_prefers_measured_pose_over_display_stabilized_pose(self):
+        target = self.targets[0]
+        target.display_pose = SimpleNamespace(
+            rvec=target.pose.rvec + np.array([0., 0., .7]),
+            tvec=target.pose.tvec + np.array([80., 0., 0.]))
+        with patch('core.multi_target_live.render_cad_pose_layer',
+                   return_value=np.zeros_like(self.frame)) as render:
+            draw_targets(self.frame, [target], self.initializer,
+                         show_axes=False, outline_seeder=self.seeder)
+        self.assertEqual(render.call_count, 1)
+        args = render.call_args.args
+        np.testing.assert_array_equal(args[4], target.pose.rvec)
+        np.testing.assert_array_equal(args[5], target.pose.tvec)
+
+    def test_axes_use_unwrapped_display_pose_while_contour_uses_metric_pose(self):
+        target = self.targets[0]
+        target.display_pose = SimpleNamespace(
+            rvec=target.pose.rvec + np.array([0., 0., .7]),
+            tvec=target.pose.tvec + np.array([80., 0., 0.]))
+        with patch('core.multi_target_live.render_cad_pose_layer',
+                   return_value=np.zeros_like(self.frame)) as render:
+            draw_targets(self.frame, [target], self.initializer,
+                         show_axes=True, outline_seeder=self.seeder)
+        kwargs = render.call_args.kwargs
+        np.testing.assert_array_equal(kwargs['axis_rvec'], target.display_pose.rvec)
+        np.testing.assert_array_equal(kwargs['axis_tvec'], target.display_pose.tvec)
+        np.testing.assert_array_equal(render.call_args.args[4], target.pose.rvec)
+        np.testing.assert_array_equal(render.call_args.args[5], target.pose.tvec)
+
     def test_contour_defaults_preserve_axes_and_display_toggle(self):
+        self.assertFalse(parse_args([]).display_edge_correction)
+        self.assertTrue(parse_args(['--multi-target', '--display-edge-correction']).display_edge_correction)
         self.assertFalse(parse_args([]).show_box)
         self.assertFalse(parse_args(['--multi-target']).show_box)
         self.assertTrue(parse_args(['--multi-target']).cad_outline)

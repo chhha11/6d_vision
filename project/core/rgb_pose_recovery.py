@@ -69,6 +69,59 @@ def axis_matches_pose(observed_angle, rvec, tvec, K, dist):
     return abs(axis_angle_difference(observed_angle, axis_angle(controls))) <= 18.
 
 
+def directed_long_axis_vector(rvec, tvec, K, dist, min_length_px=20.):
+    """Return the image vector from the model origin toward local ``+Z``.
+
+    ``axis_matches_pose`` intentionally treats the detected line as undirected:
+    a line detector cannot tell ``+Z`` from ``-Z``.  That is useful for a
+    standalone validation, but it also admits the 180-degree PnP branch for a
+    symmetric elongated target.  A tracked pose has a previous directed axis,
+    so this helper exposes the sign needed by the temporal continuity gate.
+    When the axis is nearly foreshortened, its sign is not observable and the
+    caller should leave the candidate unconstrained.
+    """
+    controls = project_points(CONTROL_POINTS, rvec, tvec, K, dist)
+    vector = np.asarray(controls[1] - controls[0], np.float64).reshape(2)
+    length = float(np.linalg.norm(vector))
+    if not np.isfinite(vector).all() or length < float(min_length_px):
+        return None
+    return vector / length
+
+
+def directed_long_axis_jump_deg(previous_rvec, previous_tvec, rvec, tvec,
+                                K, dist, min_length_px=20.):
+    """Measure the signed image-axis change between two metric poses.
+
+    The returned value is in ``[0, 180]``.  Unlike ``axis_angle_difference`` it
+    preserves the distinction between a continuous turn and a sudden reversal
+    of the model's local long-axis direction.
+    """
+    previous = directed_long_axis_vector(previous_rvec, previous_tvec, K, dist,
+                                         min_length_px)
+    current = directed_long_axis_vector(rvec, tvec, K, dist, min_length_px)
+    if previous is None or current is None:
+        return None
+    cosine = float(np.clip(np.dot(previous, current), -1., 1.))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def pose_has_continuous_long_axis(previous_pose, pose, K, dist,
+                                  max_jump_deg=120., min_length_px=20.):
+    """Reject a sudden 180-degree branch switch in a live pose track.
+
+    A real target can eventually rotate through 180 degrees, but at camera
+    frame rates it must pass through intermediate directions.  Returning true
+    when either projected axis is too short keeps the gate from inventing a
+    sign while the object is viewed end-on.
+    """
+    if previous_pose is None or pose is None:
+        return True
+    jump = directed_long_axis_jump_deg(
+        previous_pose.rvec, previous_pose.tvec, pose.rvec, pose.tvec,
+        K, dist, min_length_px)
+    return jump is None or jump <= float(max_jump_deg)
+
+
 class RgbPoseRecovery:
     """Use a confirmed object reference to detect correspondence drift.
 

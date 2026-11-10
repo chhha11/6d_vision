@@ -1563,6 +1563,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="true displays measured 6DoF; neutral only changes the displayed box")
     parser.add_argument("--cad-outline", action=argparse.BooleanOptionalAction, default=True,
                         help="Show CAD silhouette and model axes; Z follows the long axis")
+    parser.add_argument("--display-edge-correction", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Multi-target only: experimental display-only edge translation; disabled by default")
     parser.add_argument("--show-box", action=argparse.BooleanOptionalAction, default=False,
                         help="Show the optional metric model bounding box in single-target mode")
     parser.add_argument("--pose-axes", action=argparse.BooleanOptionalAction, default=True,

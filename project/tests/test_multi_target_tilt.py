@@ -96,6 +96,8 @@ class MultiTargetTiltTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(solve.call_count, 1)
         self.assertEqual(solve.call_args.kwargs['pnp_method'], cv2.SOLVEPNP_ITERATIVE)
+        self.assertIs(solve.call_args.kwargs['prior_pose'], self.pose)
+        np.testing.assert_allclose(result.motion_shift_px, [0., 0.], atol=1e-6)
         self.assertNotIn('initial_pose', solve.call_args.kwargs)
         self.assertIsNone(solve_correspondences(
             self.points[:11], self.pose.pixels[:11], self.K, self.dist,

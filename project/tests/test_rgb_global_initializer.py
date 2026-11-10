@@ -46,6 +46,16 @@ class RgbGlobalInitializerTest(unittest.TestCase):
                    return_value=(True, self.rvec.copy(), self.tvec.copy(), malformed)):
             self.assertIsNone(self.solve())
 
+    def test_malformed_reference_view_is_ignored_before_matching(self):
+        # A stale cache can contain more descriptors than CAD points. Such a
+        # view must be discarded at the initializer boundary because queryIdx
+        # names a row in the descriptor/point correspondence table.
+        malformed = ReferenceView('stale', self.points[:-1],
+                                  np.ones((len(self.points), 8), np.uint8),
+                                  pixels=self.uv[:-1])
+        initializer = RgbGlobalInitializer(self.K, self.dist, self.points, [malformed])
+        self.assertEqual(initializer.views, [])
+
     def test_pose_on_another_object_or_small_patch_is_rejected(self):
         self.assertIsNone(self.solve(box=[20., 20., 150., 150.]))
         self.assertIsNone(self.solve(pixels=np.random.default_rng(17).uniform(0, 400, (13, 2))))

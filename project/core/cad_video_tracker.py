@@ -244,7 +244,9 @@ DISPLAY_POSE_STATES = {'TRACKING', 'STATIC LOCKED', 'STATIC CORRECTED',
                        'RGB RECOVERED', 'POSE CHECK', 'POSE CORRECTED',
                        'POSE RELOCALIZED', 'REGION TRACKED'}
 VISIBLE_POSE_STATES = DISPLAY_POSE_STATES | {'TRACKING HOLD'}
-BOX_DISPLAY_Y_OFFSET_PX = 0.0
+# Display-only correction for the CAD overlay. This is deliberately kept
+# separate from metric rvec/tvec, which are passed to the robot unchanged.
+BOX_DISPLAY_Y_OFFSET_PX = 8.0
 BOX_DISPLAY_SETTINGS_PATH = DATA_ROOT / 'tracking' / 'box_display_settings.json'
 REACQUIRE_EXIT_CODE = 2
 

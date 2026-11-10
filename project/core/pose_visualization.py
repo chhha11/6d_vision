@@ -157,7 +157,7 @@ def model_axis_points(vertices):
 def render_cad_pose_layer(frame_shape, vertices, K, dist, rvec, tvec, seeder,
                           display_y_offset_px=0., show_axes=True,
                           contour_color=(70, 255, 70), display_box=None,
-                          display_affine=None,
+                          display_affine=None, axis_rvec=None, axis_tvec=None,
                           display_box_max_scale_error=.25,
                           display_box_max_shift_px=24.):
     """Shift the entire display layer together, never its metric pose inputs.
@@ -174,13 +174,16 @@ def render_cad_pose_layer(frame_shape, vertices, K, dist, rvec, tvec, seeder,
     if np.min(np.asarray(vertices) @ rotation[2] + tvec[2]) <= 1.:
         return layer
     silhouette = seeder.mask(frame_shape, vertices, rvec, tvec, erode=False)
+    axis_rvec = rvec if axis_rvec is None else np.asarray(axis_rvec, np.float64).reshape(3)
+    axis_tvec = tvec if axis_tvec is None else np.asarray(axis_tvec, np.float64).reshape(3)
     contours, _ = cv2.findContours(silhouette, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(layer, contours, -1, contour_color, 2, cv2.LINE_AA)
     if show_axes:
         points = model_axis_points(vertices)
-        pixels, _ = cv2.projectPoints(points, rvec, tvec, K, dist)
+        axis_rotation, _ = cv2.Rodrigues(axis_rvec)
+        pixels, _ = cv2.projectPoints(points, axis_rvec, axis_tvec, K, dist)
         pixels = pixels.reshape(-1, 2)
-        camera_points = points @ rotation.T + tvec
+        camera_points = points @ axis_rotation.T + axis_tvec
         if np.isfinite(pixels).all() and np.max(np.abs(pixels)) < 1e6:
             origin = tuple(np.rint(pixels[0]).astype(int))
             colors = ((40, 40, 255), (40, 220, 40), (255, 120, 40))

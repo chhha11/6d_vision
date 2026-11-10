@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import colorsys
+import inspect
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -13,11 +15,14 @@ from scipy.optimize import linear_sum_assignment
 
 from .background_detector import BackgroundDetector, advance_box
 from .cad_video_tracker import BOX_SIGNS, box_overlap, detection_matches_pose, load_video_timestamps
+from .ego_motion import IdentityEgoMotion
 from .multi_target_detection import detect_target_boxes, detect_live_target_boxes
 from .multi_target_tracking import replenish_pose, needs_replenishment, advance_pose_trail, reference_improves_pose
 from .frame_trail import FrameTrail
 from .pose_visualization import (display_edge_distance, estimate_display_affine,
                                   render_cad_pose_layer)
+from .rgb_pose_recovery import (directed_long_axis_jump_deg,
+                                    pose_has_continuous_long_axis)
 from .surface_seeding import VisibleSurfaceSeeder
 from .tracking_diagnostics import TrackingDiagnostics
 
@@ -37,9 +42,24 @@ class Target:
     pose_box: object = None
     pose_time: float = -float('inf')
     display_pose: object = None
-    # Most recent detector extent in the current frame. This is used only to
-    # align the rendered CAD contour; it never changes the metric pose.
+    # Most recent detector extent in the current frame. It is retained as an
+    # association/diagnostic hint and never changes the metric pose.
     observed_box: object = None
+    # Keep detector measurement, optical-flow prediction and the box used by
+    # association/display as separate state. ``box`` remains the legacy
+    # compatibility alias for the current filtered/association box.
+    raw_detection_box: object = None
+    predicted_box: object = None
+    filtered_box: object = None
+    # CAD projection in the current image.  This is deliberately separate
+    # from ``filtered_box``: the latter is the detector/flow association ROI.
+    pose_projection_box: object = None
+    box_source: str = "detection"
+    pose_status: str = "detected"
+    pose_prediction_frames: int = 0
+    pose_prediction_time: float = -float('inf')
+    pose_frame: str = "camera"
+    ego_motion_source: str = "identity"
     display_affine: object = None
     display_refit_at: int = -20
     display_motion_px: float = 0.
@@ -57,16 +77,24 @@ class Target:
     seeded_rvec: object = None
     tracking_failure: str | None = None
     initialization_failure: str | None = None
+    # Directed axis continuity is a metric-pose diagnostic.  A value near
+    # 180 degrees means the latest candidate came from the opposite PnP
+    # branch, even when its reprojection RMS is small.
+    long_axis_jump_deg: object = None
 
     def clear_pose(self):
         self.pose = self.last_good_pose = self.display_pose = None
         self.pose_source = self.pose_box = self.search = None
         self.observed_box = None
+        self.pose_projection_box = None
         self.display_affine = None
         self.display_refit_at = -20
         self.display_motion_px = 0.
         self.display_rotation_deg = 0.
         self.pose_time = -float('inf')
+        self.pose_prediction_time = -float('inf')
+        self.pose_prediction_frames = 0
+        self.pose_status = 'detected'
         self.display_held = False
         self.display_candidate_affine = None
         self.display_candidate_hits = 0
@@ -75,6 +103,137 @@ class Target:
         self.reference_checked_at = 0
         self.seeded_rvec = None
         self.initialization_failure = None
+        self.long_axis_jump_deg = None
+
+    @property
+    def pose_camera(self):
+        """Explicit alias for the current CAD pose in the RGB camera frame."""
+        return self.pose
+
+    @pose_camera.setter
+    def pose_camera(self, value):
+        self.pose = value
+
+
+def _copy_box(box):
+    return None if box is None else np.asarray(box, np.float32).reshape(4).copy()
+
+
+def _box_diagnostics(observed, projected):
+    """Return comparable detector/CAD box errors in image pixels.
+
+    These values are diagnostic only.  They do not alter the metric pose or
+    silently apply a screen-space correction to the CAD projection.
+    """
+    if observed is None or projected is None:
+        return None
+    observed = np.asarray(observed, np.float64).reshape(4)
+    projected = np.asarray(projected, np.float64).reshape(4)
+    if not np.isfinite(observed).all() or not np.isfinite(projected).all():
+        return None
+    observed_size = np.maximum(observed[2:] - observed[:2], 0.)
+    projected_size = np.maximum(projected[2:] - projected[:2], 0.)
+    intersection = np.maximum(0., np.minimum(observed[2:], projected[2:]) -
+                              np.maximum(observed[:2], projected[:2]))
+    overlap = float(np.prod(intersection))
+    observed_area = float(np.prod(observed_size))
+    projected_area = float(np.prod(projected_size))
+    union = observed_area + projected_area - overlap
+    observed_center = (observed[:2] + observed[2:]) * .5
+    projected_center = (projected[:2] + projected[2:]) * .5
+    scale_ratio = float(np.sqrt(observed_area / projected_area)) if projected_area > 1. else None
+    aspect_ratio = None
+    if projected_size[0] > 1. and projected_size[1] > 1.:
+        aspect_ratio = float((observed_size[0] / observed_size[1]) /
+                             (projected_size[0] / projected_size[1]))
+    return dict(iou=(overlap / union if union > 1. else 0.),
+                center_error_px=float(np.linalg.norm(observed_center - projected_center)),
+                scale_ratio=scale_ratio, aspect_ratio=aspect_ratio)
+
+
+def _box_filter(previous, measurement, prediction=None, alpha=.7):
+    """Fuse a detector extent with checked flow without accepting a jump.
+
+    The detector remains the measurement source.  The flow prediction only
+    supplies the low-frequency prior, so a one-frame multi-view box excursion
+    cannot move the displayed extent by its full amount.
+    """
+    measurement = _copy_box(measurement)
+    if measurement is None:
+        return _copy_box(prediction if prediction is not None else previous)
+    prior = _copy_box(prediction if prediction is not None else previous)
+    if prior is None:
+        return measurement
+    prior_size = np.maximum(prior[2:] - prior[:2], 1.)
+    measured_size = np.maximum(measurement[2:] - measurement[:2], 1.)
+    prior_center = (prior[:2] + prior[2:]) * .5
+    measured_center = (measurement[:2] + measurement[2:]) * .5
+    center_limit = max(12., .45 * float(np.linalg.norm(prior_size)))
+    if np.linalg.norm(measured_center - prior_center) > center_limit:
+        return measurement
+    size_ratio = measured_size / prior_size
+    if np.any(size_ratio < .65) or np.any(size_ratio > 1.55):
+        return measurement
+    return (prior + float(alpha) * (measurement - prior)).astype(np.float32)
+
+
+def _predict_pose_from_box(pose, previous_box, current_box, K):
+    """Create a short-lived image-motion pose prediction.
+
+    A failed LK/PnP update must not make a verified contour blink out for one
+    frame.  This fallback follows image translation and only a checked,
+    nearly-uniform box scale.  A real depth change expands or contracts both
+    axes together; a horizontal target's edge mask often changes only one axis
+    or changes the two axes by very different amounts.  The latter is treated
+    as extent noise so it cannot make the CAD contour jump in size.  It is
+    explicitly marked as predicted and is never used as a new metric
+    measurement.
+    """
+    if pose is None or previous_box is None or current_box is None:
+        return None
+    previous_box = np.asarray(previous_box, np.float64).reshape(4)
+    current_box = np.asarray(current_box, np.float64).reshape(4)
+    if not np.isfinite(previous_box).all() or not np.isfinite(current_box).all():
+        return None
+    old_size = previous_box[2:] - previous_box[:2]
+    new_size = current_box[2:] - current_box[:2]
+    if np.any(old_size < 20.) or np.any(new_size < 20.):
+        return None
+    old_center = (previous_box[:2] + previous_box[2:]) * .5
+    new_center = (current_box[:2] + current_box[2:]) * .5
+    scale_xy = new_size / np.maximum(old_size, 1e-6)
+    if not np.isfinite(scale_xy).all() or np.any(scale_xy <= 0.):
+        return None
+    # Use extent as a depth cue only when both axes agree.  A single-axis
+    # change is common when a horizontal object rotates slightly or an edge is
+    # segmented differently.  Damping keeps a genuine slow approach/recede
+    # responsive while preventing one noisy box from changing depth abruptly.
+    log_scale_xy = np.log(scale_xy)
+    uniform_scale = (np.sign(log_scale_xy[0]) == np.sign(log_scale_xy[1]) and
+                     abs(float(log_scale_xy[0] - log_scale_xy[1])) <= .18)
+    log_scale = float(np.mean(log_scale_xy)) if uniform_scale else 0.
+    log_scale = float(np.clip(.55 * log_scale, np.log(.86), np.log(1.16)))
+    scale = float(np.exp(log_scale))
+    tvec = np.asarray(pose.tvec, np.float64).reshape(3).copy()
+    if not np.isfinite(tvec).all() or tvec[2] <= 1.:
+        return None
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    if fx <= 1. or fy <= 1.:
+        return None
+    # Only the uniform, damped component changes depth.  The detector extent is
+    # still not a full depth sensor, so this remains a short-lived prediction
+    # and never refreshes the measured pose timestamp.
+    tvec[2] /= scale
+    tvec[0] += (new_center[0] - old_center[0]) * tvec[2] / fx
+    tvec[1] += (new_center[1] - old_center[1]) * tvec[2] / fy
+    pose_pixels = getattr(pose, 'pixels', None)
+    if pose_pixels is None:
+        return None
+    pixels = np.asarray(pose_pixels, np.float32).reshape(-1, 2)
+    if len(pixels) and np.isfinite(pixels).all():
+        pixels = ((pixels - old_center.astype(np.float32)) * scale +
+                  new_center.astype(np.float32)).astype(np.float32)
+    return replace(pose, tvec=tvec, pixels=pixels)
 
 
 
@@ -131,9 +290,11 @@ def lock_long_axis_twist(pose, reference_pose):
 def association_overlap(target, box):
     """Do not let a merged/background detection consume a measured track.
 
-    After a pose measurement target.box is the current CAD projection. Use the
-    same scale/aspect envelope as pose verification when assigning detector
-    hints; rejected hints remain eligible for independent initialization.
+    ``target.box`` is the detector/flow association extent.  CAD projection is
+    kept separately so a new detector result cannot overwrite the tracking ROI.
+    Use the same scale/aspect envelope as pose verification when assigning
+    detector hints; rejected hints remain eligible for independent
+    initialization.
     """
     overlap = box_overlap(target.box, box)[0]
     if target.last_good_pose is None and (
@@ -220,10 +381,18 @@ class TargetSet:
                              if target.visible and target.pose is not None]
         propagated = set()
         for target in previous:
+            # A prediction is valid only for this source/current frame pair.
+            # Do not let a successful flow estimate from an older frame become
+            # the prior for a later detector measurement after flow fails.
+            target.predicted_box = None
             if target.visible and self.previous is not None:
-                moved = advance_box(self.previous, frame, target.box)
+                flow_seed = target.filtered_box if target.filtered_box is not None else target.box
+                moved = advance_box(self.previous, frame, flow_seed)
                 if moved is not None:
+                    target.predicted_box = _copy_box(moved)
+                    target.filtered_box = _copy_box(moved)
                     target.box = moved
+                    target.box_source = 'optical_flow'
                     propagated.add(target.id)
             target.visible = False
             target.detected = False
@@ -250,8 +419,16 @@ class TargetSet:
                         continue
                     target = group[row]
                     index = available[column]
-                    target.box = np.asarray(boxes[index], np.float32).copy()
-                    target.observed_box = target.box.copy()
+                    measurement = _copy_box(boxes[index])
+                    target.raw_detection_box = measurement.copy()
+                    target.filtered_box = _box_filter(
+                        target.filtered_box if target.filtered_box is not None else target.box,
+                        measurement, target.predicted_box,
+                        alpha=(1. if target.pose is not None else .7))
+                    target.box = target.filtered_box.copy()
+                    target.box_source = ('pose_association' if target.pose is not None
+                                         else 'filtered_detection')
+                    target.observed_box = measurement.copy()
                     target.last_seen = now
                     target.visible = target.detected = True
                     target.gap_frames = 0
@@ -261,8 +438,12 @@ class TargetSet:
                 if any(duplicate_candidate_boxes(box, measured.box)
                        for measured in measured_previous):
                     continue
-                target = Target(self.next_id, np.asarray(box, np.float32).copy(), now,
-                                observed_box=np.asarray(box, np.float32).copy())
+                measurement = _copy_box(box)
+                target = Target(self.next_id, measurement.copy(), now,
+                                observed_box=measurement.copy(),
+                                raw_detection_box=measurement.copy(),
+                                filtered_box=measurement.copy(),
+                                box_source='detection')
                 self.targets[target.id] = target
                 self.next_id += 1
         for target in self.targets.values():
@@ -298,9 +479,13 @@ class TargetSet:
 class IndependentPoses:
     """Bounded background search, one target at a time in round-robin order."""
 
-    def __init__(self, loader, image_size=None, grace_s=.25, max_hold_frames=6):
+    def __init__(self, loader, image_size=None, grace_s=.25, max_hold_frames=6,
+                 ego_motion=None):
         self.image_size = image_size
         self.grace_s, self.max_hold_frames = grace_s, max_hold_frames
+        self.ego_motion = ego_motion or IdentityEgoMotion()
+        if not callable(getattr(self.ego_motion, 'pose_at', None)):
+            raise TypeError('ego_motion must provide pose_at(timestamp)')
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='multi-pose')
         self.loading = self.executor.submit(loader)
         self.pending = None
@@ -308,7 +493,7 @@ class IndependentPoses:
         self.pending_refresh = False
         self.stats = dict(submitted=0, no_reference_pose=0, target_lost=0, expired=0,
                           history_lost=0, handoff_failed=0, detector_conflict=0,
-                          superseded=0, accepted=0, corrected=0)
+                          long_axis_branch=0, superseded=0, accepted=0, corrected=0)
         self.last_id = 0
         self.search_round = 0
         self.last_recovery_id = 0
@@ -337,9 +522,23 @@ class IndependentPoses:
             self.error = str(exc)
             return
         def accept(target, pose, *, reference=False):
+            previous_pose = target.pose if target.pose is not None else target.last_good_pose
+            target.long_axis_jump_deg = None
+            if previous_pose is not None:
+                target.long_axis_jump_deg = directed_long_axis_jump_deg(
+                    previous_pose.rvec, previous_pose.tvec,
+                    pose.rvec, pose.tvec, initializer.K, initializer.dist)
+            if not pose_has_continuous_long_axis(
+                    previous_pose, pose, initializer.K, initializer.dist):
+                # A low RMS is insufficient for an elongated/symmetric target:
+                # PnP can fit a second 180-degree pose branch just as well. Keep
+                # the last verified pose and let temporal tracking or a later
+                # reference search recover through intermediate directions.
+                self.stats['long_axis_branch'] += 1
+                target.initialization_failure = 'long_axis_branch'
+                return False
             if new_frame:
                 target.tracked_frames += 1
-            previous_pose = target.pose if target.pose is not None else target.last_good_pose
             if previous_pose is not None:
                 try:
                     old_center, _ = cv2.projectPoints(
@@ -372,7 +571,26 @@ class IndependentPoses:
                 target.seeded_rvec = pose.rvec.copy()
             if reference:
                 target.reference_checked_at = target.tracked_frames
+            # A temporal pose update also carries the median displacement of
+            # the real image correspondences.  If the detector and its box
+            # flow both missed this frame, use that measured displacement to
+            # advance the association ROI.  A box already advanced by checked
+            # ROI flow must not be shifted a second time, and the CAD
+            # projection is never allowed to drive the ROI.
+            motion_shift = getattr(pose, 'motion_shift_px', None)
+            if (not target.detected and target.predicted_box is None
+                    and motion_shift is not None and target.box is not None):
+                motion_shift = np.asarray(motion_shift, np.float32).reshape(2)
+                if np.isfinite(motion_shift).all():
+                    target.box = (np.asarray(target.box, np.float32).reshape(4)
+                                  + np.tile(motion_shift, 2)).astype(np.float32)
+                    target.filtered_box = target.box.copy()
+                    target.predicted_box = target.box.copy()
+                    target.box_source = 'optical_flow'
             target.pose = target.last_good_pose = pose
+            target.pose_status = 'pose_verified'
+            target.pose_prediction_frames = 0
+            target.pose_prediction_time = -float('inf')
             from .cad_video_tracker import project
             pixels = project(initializer.vertices, pose.rvec, pose.tvec,
                              initializer.K, initializer.dist)
@@ -380,15 +598,39 @@ class IndependentPoses:
             bounds = np.clip(np.r_[pixels.min(0), pixels.max(0)],
                              [0, 0, 0, 0], [width-1, height-1, width-1, height-1])
             if np.isfinite(bounds).all() and np.min(bounds[2:] - bounds[:2]) >= 20.:
-                target.box = bounds.astype(np.float32)
+                target.pose_projection_box = bounds.astype(np.float32)
+                # Keep the association box independent from the metric CAD
+                # projection. In a detector gap, writing this projection back
+                # into ``target.box`` creates a positive-feedback loop: a
+                # slightly wrong pose moves the ROI, the moved ROI selects a
+                # different background edge, and the next pose drifts farther.
+                # The detector/flow box remains the only association prior;
+                # the CAD projection is used separately for pose validation and
+                # diagnostics.
+            # The temporal source box belongs to detector/flow association.
+            # Keep it separate from the CAD projection so a pose error cannot
+            # feed back into the next image search.
             target.pose_source, target.pose_box = frame_source, target.box.copy()
             target.pose_time = now
+            target.pose_frame = 'camera'
+            target.ego_motion_source = getattr(self.ego_motion, 'source', 'identity')
             target.failed_frames = 0
             target.tracking_failure = None
             target.initialization_failure = None
+            return True
 
         for target in targets:
-            base = target.last_good_pose if target.last_good_pose is not None else target.pose
+            # This is a per-frame diagnostic.  ``accept`` fills it when a new
+            # measured candidate is evaluated; leaving it empty avoids making
+            # an old branch jump look like a current-frame event.
+            target.long_axis_jump_deg = None
+            # A predicted pose carries the latest image motion forward.  A
+            # measured pose always starts from the last verified measurement.
+            if target.pose_status == 'pose_predicted' and target.pose is not None:
+                base = target.pose
+            else:
+                base = (target.last_good_pose if target.last_good_pose is not None
+                        else target.pose)
             source = target.pose_source if target.pose_source is not None else self.previous
             can_retry = target.pose is not None or now - target.pose_time <= self.grace_s
             if base is not None and source is not None and can_retry:
@@ -407,15 +649,80 @@ class IndependentPoses:
                     pose = advance_pose(base, source, frame, initializer.K,
                                         initializer.dist, initializer.vertices,
                                         target.pose_box, retry_pnp=True)
-                if pose is not None and (not target.detected or detection_matches_pose(
-                        target.box, initializer.vertices, pose.rvec, pose.tvec,
-                        initializer.K, initializer.dist, frame.shape)):
-                    accept(target, pose)
+                validation_box = (target.raw_detection_box if target.detected
+                                  and target.raw_detection_box is not None else
+                                  target.predicted_box)
+                if (validation_box is None and pose is not None
+                        and target.box is not None):
+                    motion_shift = getattr(pose, 'motion_shift_px', None)
+                    if motion_shift is not None:
+                        motion_shift = np.asarray(motion_shift, np.float32).reshape(2)
+                        if np.isfinite(motion_shift).all():
+                            # This is a temporary validation box for the
+                            # current frame. ``accept`` commits the same shift
+                            # only after the pose passes all metric gates.
+                            validation_box = (np.asarray(target.box, np.float32)
+                                              + np.tile(motion_shift, 2))
+                # Detector gaps still have an independent image-space prior when
+                # the detector ROI was advanced by checked optical flow. If that
+                # flow failed, the measured point motion supplies a temporary
+                # box for validation. Never use the CAD projection itself.
+                box_is_valid = (pose is not None and (validation_box is None or
+                    detection_matches_pose(validation_box, initializer.vertices,
+                                           pose.rvec, pose.tvec, initializer.K,
+                                           initializer.dist, frame.shape)))
+                if pose is not None and box_is_valid:
+                    if accept(target, pose):
+                        continue
+                    reason = 'long_axis_branch'
+                elif pose is not None:
+                    reason = 'detector_conflict'
                 else:
+                    reason = 'flow_or_pnp'
+                if reason == 'long_axis_branch':
                     target.pose = None
-                    target.tracking_failure = ('flow_or_pnp' if pose is None else 'detector_conflict')
+                    target.pose_status = 'detected'
+                    target.tracking_failure = reason
+                    continue
+                if reason == 'detector_conflict' or reason == 'flow_or_pnp':
+                    predicted_box = None
+                    if target.pose_box is not None and source is not None:
+                        predicted_box = advance_box(source, frame, target.pose_box)
+                    predicted_pose = _predict_pose_from_box(
+                        base, target.pose_box, predicted_box, initializer.K)
+                    predicted_ok = (predicted_pose is not None and
+                                    target.pose_prediction_frames < 3 and
+                                    (not target.detected or detection_matches_pose(
+                                        validation_box, initializer.vertices,
+                                        predicted_pose.rvec, predicted_pose.tvec,
+                                        initializer.K, initializer.dist, frame.shape)))
+                    if predicted_ok:
+                        target.pose = predicted_pose
+                        target.pose_status = 'pose_predicted'
+                        target.pose_prediction_frames += 1
+                        target.pose_prediction_time = now
+                        target.pose_source = frame_source
+                        target.pose_box = predicted_box.astype(np.float32)
+                        # Keep the association ROI from checked box flow, but
+                        # derive the diagnostic CAD box from the predicted
+                        # metric pose. The two can differ during scale/depth
+                        # prediction and must not be conflated.
+                        projection = project_target_box(target, initializer)
+                        if projection is not None:
+                            target.pose_projection_box = np.asarray(
+                                np.r_[projection[1].min(0), projection[1].max(0)],
+                                np.float32)
+                        else:
+                            target.pose_projection_box = np.asarray(
+                                predicted_box, np.float32).copy()
+                        target.tracking_failure = reason
+                    else:
+                        target.pose = None
+                        target.pose_status = 'detected'
+                        target.tracking_failure = reason
             elif base is not None:
                 target.pose = None
+                target.pose_status = 'detected'
                 target.tracking_failure = target.tracking_failure or 'recovery_expired'
         if self.pending is not None and self.pending.done():
             target_id, source, captured_at, search = self.request
@@ -441,18 +748,27 @@ class IndependentPoses:
                                                   replenish=not self.pending_refresh)
                     if pose is None:
                         reason = 'handoff_failed'
-                    elif not detection_matches_pose(
-                            target.box, initializer.vertices, pose.rvec, pose.tvec,
-                            initializer.K, initializer.dist, frame.shape):
-                        reason = 'detector_conflict'
-                    elif target.pose is not None and not reference_improves_pose(
-                            target.pose, pose, initializer):
-                        reason = 'superseded'
                     else:
-                        if target.pose is not None:
-                            self.stats['corrected'] += 1
-                        accept(target, pose, reference=True)
-                        self.stats['accepted'] += 1
+                        validation_box = (target.raw_detection_box if target.detected
+                                          and target.raw_detection_box is not None else target.box)
+                        if not detection_matches_pose(
+                                validation_box, initializer.vertices, pose.rvec, pose.tvec,
+                                initializer.K, initializer.dist, frame.shape):
+                            reason = 'detector_conflict'
+                        elif (pose is not None and not pose_has_continuous_long_axis(
+                                target.pose if target.pose is not None else target.last_good_pose,
+                                pose, initializer.K, initializer.dist)):
+                            reason = 'long_axis_branch'
+                        elif target.pose is not None and not reference_improves_pose(
+                                target.pose, pose, initializer):
+                            reason = 'superseded'
+                        else:
+                            if target.pose is not None:
+                                self.stats['corrected'] += 1
+                            if accept(target, pose, reference=True):
+                                self.stats['accepted'] += 1
+                            else:
+                                reason = 'long_axis_branch'
                 if reason is not None:
                     self.stats[reason] += 1
                     if target is not None and reason != 'superseded':
@@ -463,30 +779,14 @@ class IndependentPoses:
             self.pending_trail = None
         for target in targets:
             target.display_held = False
-            previous_display_pose = target.display_pose
             if target.pose is not None:
-                # Roll around the model's long (local Z) axis is deliberately
-                # ignored in the rendered overlay. Keep the measured pose for
-                # tracking and metrics, but stabilize the displayed X/Y axes.
-                target.display_pose = lock_long_axis_twist(
-                    target.pose, previous_display_pose)
-                if previous_display_pose is None:
-                    target.display_rotation_deg = 0.
-                else:
-                    try:
-                        old_rotation, _ = cv2.Rodrigues(
-                            np.asarray(previous_display_pose.rvec,
-                                       np.float64).reshape(3))
-                        new_rotation, _ = cv2.Rodrigues(
-                            np.asarray(target.display_pose.rvec,
-                                       np.float64).reshape(3))
-                        cosine = np.clip(
-                            (np.trace(new_rotation @ old_rotation.T) - 1.) / 2.,
-                            -1., 1.)
-                        target.display_rotation_deg = float(
-                            np.rad2deg(np.arccos(cosine)))
-                    except (cv2.error, TypeError, ValueError):
-                        target.display_rotation_deg = 0.
+                # Keep the metric pose untouched for robot output.  The
+                # display pose unwraps the sign-ambiguous long axis so a
+                # symmetric elongated target does not make the overlay arrow
+                # reverse when PnP visits the equivalent branch.
+                reference_display = (target.display_pose if target.display_pose is not None
+                                      else target.last_good_pose)
+                target.display_pose = lock_long_axis_twist(target.pose, reference_display)
                 continue
             target.display_pose = None
             if new_frame:
@@ -498,11 +798,12 @@ class IndependentPoses:
             moved = advance_box(target.pose_source, frame, target.pose_box)
             # Hold only nearly stationary, still-supported objects. Actual motion
             # needs a newly solved pose; a stale contour must not trail the hand.
+            validation_box = (target.raw_detection_box if target.detected
+                              and target.raw_detection_box is not None else target.box)
             if (moved is not None and np.max(np.abs(moved - target.pose_box)) <= 4.
-                    and detection_matches_pose(target.box, initializer.vertices,
+                    and detection_matches_pose(validation_box, initializer.vertices,
                         base.rvec, base.tvec, initializer.K, initializer.dist, frame.shape)):
-                target.display_pose = lock_long_axis_twist(
-                    base, previous_display_pose)
+                target.display_pose = base
                 target.display_rotation_deg = 0.
                 target.display_held = True
         self.previous = frame.copy()
@@ -549,8 +850,23 @@ class IndependentPoses:
             self.pending_trail = FrameTrail(source)
             self.pending_refresh = target.pose is not None
             self.stats['submitted'] += 1
-            self.pending = self.executor.submit(target.search.estimate, source, box,
-                                                validation_box=box)
+            prior_pose = (target.last_good_pose if target.last_good_pose is not None
+                          else target.pose)
+            # Keep compatibility with lightweight/custom search objects used by
+            # older callers.  The built-in RgbPoseSearch accepts the temporal
+            # prior; a legacy callable without that parameter still receives
+            # the same validation box and remains usable.
+            estimate_kwargs = dict(validation_box=box)
+            try:
+                parameters = inspect.signature(target.search.estimate).parameters
+                if ('prior_pose' in parameters or
+                        any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values())):
+                    estimate_kwargs['prior_pose'] = prior_pose
+            except (TypeError, ValueError):
+                estimate_kwargs['prior_pose'] = prior_pose
+            self.pending = self.executor.submit(
+                target.search.estimate, source, box, **estimate_kwargs)
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
@@ -562,7 +878,8 @@ def project_target_box(target, initializer, *, display=False):
     No screen-space extrusion, neutralized roll or cosmetic position offset is
     applied. Both returned arrays use the same corner ordering as BOX_EDGES.
     """
-    pose = target.display_pose if display and target.display_pose is not None else target.pose
+    pose = ((target.display_pose if target.display_pose is not None else target.pose)
+            if display else target.pose)
     if pose is None or initializer is None:
         return None
     rvec = np.asarray(pose.rvec, np.float64).reshape(3)
@@ -588,14 +905,58 @@ def target_record(target, initializer=None):
     pose = target.pose
     if initializer is not None and geometry is None:
         pose = None
-    return dict(id=target.id, box_xyxy=target.box.tolist(),
+    box = target.filtered_box if target.filtered_box is not None else target.box
+    pose_box = target.pose_projection_box
+    raw_box = target.raw_detection_box
+    predicted_box = target.predicted_box
+    box_diag = _box_diagnostics(raw_box, pose_box) or {}
+    status = (target.pose_status if pose is not None else 'detected')
+    if pose is not None and status == 'detected':
+        # Tests and external callers may construct a Target with a verified
+        # pose directly, without going through IndependentPoses.accept().
+        status = 'pose_verified'
+    # Predictions retain the latest verified PnP diagnostics. They are useful
+    # for judging the age of the prediction, but are not new measurements.
+    measured_pose = (target.last_good_pose
+                     if status == 'pose_predicted' and target.last_good_pose is not None
+                     else pose)
+    return dict(id=target.id, box_xyxy=np.asarray(box).tolist(),
+                raw_detection_box_xyxy=(np.asarray(raw_box).tolist()
+                                        if raw_box is not None else None),
+                predicted_box_xyxy=(np.asarray(predicted_box).tolist()
+                                    if predicted_box is not None else None),
+                filtered_box_xyxy=np.asarray(box).tolist(),
+                cad_box_xyxy=(np.asarray(pose_box).tolist()
+                              if pose_box is not None else None),
+                association_box_xyxy=np.asarray(target.box).tolist(),
+                box_source=target.box_source,
                 detected=target.detected,
                 tracking_failure=target.tracking_failure,
                 initialization_failure=target.initialization_failure,
+                pose_status=status,
+                pose_age_frames=(target.pose_prediction_frames if pose is not None else None),
+                pose_rms_px=(getattr(measured_pose, 'rms_px', None)
+                             if measured_pose is not None else None),
+                pose_inlier_ratio=(getattr(measured_pose, 'inlier_ratio', None)
+                                   if measured_pose is not None else None),
+                pose_reference_support=(getattr(measured_pose, 'reference_support', None)
+                                        if measured_pose is not None else None),
+                long_axis_jump_deg=target.long_axis_jump_deg,
+                cad_detection_iou=box_diag.get('iou'),
+                cad_detection_center_error_px=box_diag.get('center_error_px'),
+                cad_detection_scale_ratio=box_diag.get('scale_ratio'),
+                cad_detection_aspect_ratio=box_diag.get('aspect_ratio'),
                 tracking_points=(len(pose.points) if pose is not None and hasattr(pose, 'points') else 0),
                 display_held=target.display_held,
                 display_visible=project_target_box(target, initializer, display=True) is not None,
-                state='pose_verified' if pose is not None else 'detected',
+                state=status,
+                pose_frame=(target.pose_frame if pose is not None else None),
+                pose_timestamp=(target.pose_time if pose is not None else None),
+                pose_prediction_timestamp=(target.pose_prediction_time
+                                           if pose is not None and
+                                           status == 'pose_predicted'
+                                           else None),
+                ego_motion_source=(target.ego_motion_source if pose is not None else None),
                 rvec=pose.rvec.reshape(3).tolist() if pose is not None else None,
                 tvec_mm=pose.tvec.reshape(3).tolist() if pose is not None else None,
                 box_corners_camera_mm=geometry[0].tolist() if geometry is not None else None,
@@ -611,8 +972,8 @@ def target_color(target_id):
 
 def verified_duplicate_targets(first, second, initializer=None):
     """Detect duplicate verified tracks even when their boxes have similar size."""
-    first_pose = first.display_pose if first.display_pose is not None else first.pose
-    second_pose = second.display_pose if second.display_pose is not None else second.pose
+    first_pose = first.pose if first.pose is not None else first.display_pose
+    second_pose = second.pose if second.pose is not None else second.display_pose
     if first_pose is None or second_pose is None:
         return False
     if duplicate_candidate_boxes(first.box, second.box):
@@ -621,8 +982,8 @@ def verified_duplicate_targets(first, second, initializer=None):
         return True
     if initializer is None:
         return False
-    first_geometry = project_target_box(first, initializer, display=True)
-    second_geometry = project_target_box(second, initializer, display=True)
+    first_geometry = project_target_box(first, initializer, display=first.pose is None)
+    second_geometry = project_target_box(second, initializer, display=second.pose is None)
     if first_geometry is None or second_geometry is None:
         return False
     first_pixels = first_geometry[1]
@@ -659,38 +1020,49 @@ def display_target_subset(targets, initializer=None):
 
 
 def draw_targets(frame, targets, initializer=None, show_axes=True, show_box=False,
-                 outline_seeder=None, show_outline=True, display_y_offset_px=0.):
+                 outline_seeder=None, show_outline=True, display_y_offset_px=0.,
+                 display_edge_correction=False):
     # Keep show_box for existing callers; the multi-target preview is contour-only.
     canvas = frame.copy()
     edge_distance = None
     edge_distance_ready = False
+
+    # A detector-only proposal has no metric geometry yet. Keep the preview
+    # clean until a verified 6DoF pose (or a short hold of one) exists; the
+    # detector box is still retained internally for association and recovery.
+
     for target in display_target_subset(targets, initializer):
+        # A measured/predicted CAD pose is the only geometry source for a
+        # live contour. ``display_pose`` is still useful for a short hold after
+        # a measurement gap. A stale display copy must not override a current
+        # measurement or prediction.
+        metric_pose = target.pose if target.pose is not None else target.display_pose
+        pose = target.display_pose if target.display_pose is not None else metric_pose
+        if pose is None:
+            continue
         if project_target_box(target, initializer, display=True) is None:
             continue
-        pose = target.display_pose if target.display_pose is not None else target.pose
         if show_outline and outline_seeder is not None:
-            # Refit more often while the target is moving. A long interval
-            # leaves a display-only translation behind the current pose during
-            # fast hand motion; a short, bounded interval keeps the contour
-            # responsive without running the edge search on every target on
-            # every frame. A detector extent is only an ROI hint.
+            if not display_edge_correction:
+                # Background edges are not a valid measurement of a CAD pose.
+                # Keep the field clear so a correction from an older frame or
+                # caller cannot silently shift the live contour.
+                target.display_affine = None
+                target.display_candidate_affine = None
+                target.display_candidate_hits = 0
+            # Experimental edge fitting is restricted to stationary frames.
+            # Repeated background edges can still pass consensus, so it must
+            # remain opt-in and must never update the exported metric pose.
             moving = (target.display_motion_px >= 8. or
                       target.display_rotation_deg >= 2.)
-            # During a hold, the metric pose can move by a few pixels because
-            # of depth/feature noise. Re-running the edge fit every few frames
-            # lets an unrelated background edge pull the contour around. Keep
-            # the locked correction for a while and use consensus before any
-            # stationary update. Motion still gets the short refit cadence.
-            refit_interval = (2 if moving else
-                              (8 if target.display_affine is None else 24))
+            refit_interval = 8 if target.display_affine is None else 24
             if moving:
                 target.display_candidate_affine = None
                 target.display_candidate_hits = 0
             if target.display_affine is not None:
                 # Discard corrections produced by older builds or callers.
-                # Only an identity linear part is valid for live display;
-                # translation may be carried for at most the short refit
-                # interval while the current pose is being updated.
+                # Only a bounded translation is valid for this optional
+                # display experiment; scale and shear are rejected.
                 affine = np.asarray(target.display_affine, np.float32)
                 if (affine.shape != (2, 3) or not np.isfinite(affine).all()
                         or np.max(np.abs(affine[:, :2] - np.eye(2, dtype=np.float32))) > 1e-4
@@ -698,8 +1070,9 @@ def draw_targets(frame, targets, initializer=None, show_axes=True, show_box=Fals
                     target.display_affine = None
                     target.display_candidate_affine = None
                     target.display_candidate_hits = 0
-            if (target.display_affine is None or
-                    target.tracked_frames - target.display_refit_at >= refit_interval):
+            if (display_edge_correction and not moving and
+                    (target.display_affine is None or
+                     target.tracked_frames - target.display_refit_at >= refit_interval)):
                 if not edge_distance_ready:
                     edge_distance = display_edge_distance(frame)
                     edge_distance_ready = True
@@ -707,70 +1080,57 @@ def draw_targets(frame, targets, initializer=None, show_axes=True, show_box=Fals
                     frame, initializer.vertices, initializer.K, initializer.dist,
                     pose.rvec, pose.tvec, outline_seeder,
                     display_box=(target.observed_box if target.detected else None),
-                    # Recent RGB-D frames show a stable 15-20 px pose/display
-                    # offset. Keep the correction translation-only, but let the
-                    # edge fit cover that measured range instead of leaving the
-                    # contour visibly above the object. Moving targets use a
-                    # smaller bound so a blurred background edge cannot pull the
-                    # overlay too far in one frame.
-                    max_shift_px=(16. if moving else 20.),
+                    max_shift_px=8.,
                     edge_distance=edge_distance,
-                    min_improvement_px=(.85 if moving else .55),
+                    min_improvement_px=.8,
                     allow_shape_adjustment=False)
                 if candidate is not None:
-                    if moving:
-                        # Motion needs immediate feedback. The correction is
-                        # still translation-only and bounded by the estimator.
-                        if target.display_affine is None:
-                            target.display_affine = candidate
-                        else:
-                            target.display_affine = (.55 * candidate +
-                                                     .45 * target.display_affine)
+                    candidate = np.asarray(candidate, np.float32)
+                    current = (None if target.display_affine is None else
+                               np.asarray(target.display_affine, np.float32))
+                    candidate_translation = candidate[:, 2]
+                    current_translation = (None if current is None else
+                                           current[:, 2])
+                    # Small changes are below the useful display precision;
+                    # ignoring them prevents a stationary contour from
+                    # random-walking one pixel at a time.
+                    close_to_current = (current_translation is not None and
+                                        np.linalg.norm(candidate_translation -
+                                                       current_translation) <= 1.5)
+                    if close_to_current:
+                        target.display_candidate_affine = None
+                        target.display_candidate_hits = 0
                     else:
-                        candidate = np.asarray(candidate, np.float32)
-                        current = (None if target.display_affine is None else
-                                   np.asarray(target.display_affine, np.float32))
-                        candidate_translation = candidate[:, 2]
-                        current_translation = (None if current is None else
-                                               current[:, 2])
-                        # Small changes are below the useful display precision;
-                        # ignoring them prevents a stationary contour from
-                        # random-walking one pixel at a time.
-                        close_to_current = (current_translation is not None and
-                                            np.linalg.norm(candidate_translation -
-                                                           current_translation) <= 1.5)
-                        if close_to_current:
+                        pending = target.display_candidate_affine
+                        same_as_pending = (pending is not None and
+                                           np.linalg.norm(candidate_translation -
+                                                          np.asarray(pending)[:, 2]) <= 2.5)
+                        if same_as_pending:
+                            target.display_candidate_hits += 1
+                        else:
+                            target.display_candidate_affine = candidate.copy()
+                            target.display_candidate_hits = 1
+                        needed_hits = 2 if current is None else 3
+                        if target.display_candidate_hits >= needed_hits:
+                            if current is None:
+                                target.display_affine = candidate.copy()
+                            else:
+                                # Apply a confirmed change conservatively;
+                                # the confirmation already rejected one-off
+                                # background edges, and this avoids a jump.
+                                target.display_affine = (.35 * candidate +
+                                                         .65 * current)
                             target.display_candidate_affine = None
                             target.display_candidate_hits = 0
-                        else:
-                            pending = target.display_candidate_affine
-                            same_as_pending = (pending is not None and
-                                               np.linalg.norm(candidate_translation -
-                                                              np.asarray(pending)[:, 2]) <= 2.5)
-                            if same_as_pending:
-                                target.display_candidate_hits += 1
-                            else:
-                                target.display_candidate_affine = candidate.copy()
-                                target.display_candidate_hits = 1
-                            needed_hits = 2 if current is None else 3
-                            if target.display_candidate_hits >= needed_hits:
-                                if current is None:
-                                    target.display_affine = candidate.copy()
-                                else:
-                                    # Apply a confirmed change conservatively;
-                                    # the confirmation already rejected one-off
-                                    # background edges, and this avoids a jump.
-                                    target.display_affine = (.35 * candidate +
-                                                             .65 * current)
-                                target.display_candidate_affine = None
-                                target.display_candidate_hits = 0
                 target.display_refit_at = target.tracked_frames
             layer = render_cad_pose_layer(
                 frame.shape, initializer.vertices, initializer.K, initializer.dist,
-                pose.rvec, pose.tvec, outline_seeder,
+                metric_pose.rvec, metric_pose.tvec, outline_seeder,
                 display_y_offset_px=display_y_offset_px, show_axes=show_axes,
+                axis_rvec=pose.rvec, axis_tvec=pose.tvec,
                 contour_color=target_color(target.id),
-                display_affine=target.display_affine)
+                display_affine=(target.display_affine
+                                if display_edge_correction else None))
             # Preserve the ID's color rather than adding it to background pixels.
             mask = np.any(layer != 0, axis=2)
             canvas[mask] = layer[mask]
@@ -798,9 +1158,16 @@ def run_multi_target(args):
     started_at = time.monotonic()
     try:
         if offline:
-            cap = cv2.VideoCapture(str(args.video))
+            video_path = Path(args.video).expanduser()
+            cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
-                raise RuntimeError(f'Cannot open video: {args.video}')
+                if not video_path.is_file():
+                    raise RuntimeError(
+                        f'Video file does not exist: {video_path}. '
+                        'Replace the example path after --video with the absolute path '
+                        'of a real video, or omit --video to use the camera.'
+                    )
+                raise RuntimeError(f'Cannot open video: {video_path}')
             reported_fps = cap.get(cv2.CAP_PROP_FPS)
             video_fps = reported_fps if np.isfinite(reported_fps) and reported_fps > 0 else 30.
             detector = live.prepare_live_detector(args.reacquire_model, timings)
@@ -874,7 +1241,12 @@ def run_multi_target(args):
                 canvas = draw_targets(
                     frame, visible, initializer, args.pose_axes, args.show_box,
                     outline_seeder=outline_seeder, show_outline=args.cad_outline,
-                    display_y_offset_px=args.box_display_y_offset_px or 0.)
+                    display_y_offset_px=args.box_display_y_offset_px or 0.,
+                    display_edge_correction=getattr(args, 'display_edge_correction', False))
+                if not started and not args.headless:
+                    cv2.putText(canvas, 'Press SPACE or S to start detection',
+                                (20, 36), cv2.FONT_HERSHEY_SIMPLEX, .9,
+                                (0, 255, 255), 2, cv2.LINE_AA)
                 records = [target_record(t, initializer) for t in visible]
                 record = dict(frame=frame_index, elapsed_s=now-started_at,
                     source_elapsed_s=tracking_time if offline else now-started_at,

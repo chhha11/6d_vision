@@ -19,8 +19,31 @@ import numpy as np
 from .cad_pose_overlay import load_calibration
 from .cad_video_tracker import detection_matches_pose, make_edge_points, project
 from .paths import DATA_ROOT
+from .reference_pose_corrector import CONTROL_POINTS, project_points
 from .rgb_pose_recovery import axis_matches_pose, observe_long_axis
 from .surface_seeding import VisibleSurfaceSeeder
+
+
+def _reference_view_arrays_are_aligned(points, descriptors, pixels=None):
+    """Return whether one reference keeps 3-D/descriptor/pixel rows aligned.
+
+    A descriptor match's ``queryIdx`` is an index into the reference descriptor
+    array.  It is therefore only safe to use it for CAD lookup when all three
+    arrays have the same row count.  Older feature caches were written during
+    an intermediate pipeline revision and can violate this invariant.
+    """
+    points = np.asarray(points)
+    descriptors = np.asarray(descriptors)
+    if points.ndim != 2 or points.shape[1] != 3:
+        return False
+    if descriptors.ndim != 2 or len(points) != len(descriptors):
+        return False
+    if pixels is not None:
+        pixels = np.asarray(pixels)
+        if pixels.ndim != 2 or pixels.shape[1] != 2 or len(points) != len(pixels):
+            return False
+    return bool(np.isfinite(points).all()
+                and (pixels is None or np.isfinite(pixels).all()))
 
 
 @dataclass(frozen=True)
@@ -46,12 +69,15 @@ class RgbPose:
     inlier_ratio: float
     elapsed_ms: float
     reference_support: int = 1
+    # Median image displacement measured by LK for this temporal update.
+    # This is association metadata only; it must never be folded into tvec.
+    motion_shift_px: np.ndarray | None = None
 
 
 def solve_correspondences(points, pixels, K, dist, vertices, box, reference='',
                           min_depth=150., max_depth=2000., image_shape=None,
                           pnp_method=cv2.SOLVEPNP_EPNP, min_inlier_ratio=.5,
-                          refine_inliers=True) -> RgbPose | None:
+                          refine_inliers=True, prior_pose=None) -> RgbPose | None:
     """Solve metric pose with distributed, independently checked 2D/3D evidence."""
     started = time.perf_counter()
     points = np.ascontiguousarray(points, np.float64).reshape(-1, 3)
@@ -60,9 +86,19 @@ def solve_correspondences(points, pixels, K, dist, vertices, box, reference='',
         return None
     if not np.isfinite(points).all() or not np.isfinite(pixels).all():
         return None
-    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-        points, pixels, K, dist, iterationsCount=160, reprojectionError=3.,
-        confidence=.999, flags=pnp_method)
+    # A temporal pose is a useful *initial guess*, not a measurement.  When it
+    # exists, use ITERATIVE PnP from that guess before falling back to the
+    # normal RANSAC branch.  This prevents EPNP from selecting the equally
+    # valid 180-degree solution for a symmetric elongated object on an
+    # otherwise continuous track.
+    pnp_kwargs = dict(iterationsCount=160, reprojectionError=3.,
+                      confidence=.999, flags=pnp_method)
+    if prior_pose is not None and pnp_method == cv2.SOLVEPNP_ITERATIVE:
+        pnp_kwargs.update(useExtrinsicGuess=True,
+                          rvec=np.asarray(prior_pose.rvec, np.float64).reshape(3, 1).copy(),
+                          tvec=np.asarray(prior_pose.tvec, np.float64).reshape(3, 1).copy())
+    ok, rvec, tvec, inliers = cv2.solvePnPRansac(points, pixels, K, dist,
+                                                  **pnp_kwargs)
     if (not ok or inliers is None or len(inliers) < 12
             or len(inliers) / len(points) < min_inlier_ratio):
         return None
@@ -169,7 +205,14 @@ def feature_region(gray, mask, bounds, padding=48):
 class RgbGlobalInitializer:
     def __init__(self, K, dist, vertices, views):
         self.K, self.dist, self.vertices = K, dist, vertices
-        self.views = views
+        # A malformed cached view cannot produce a valid correspondence: its
+        # descriptor query indices no longer name the same CAD points. Drop it
+        # at the boundary so one stale cache entry cannot kill the background
+        # 6DoF worker. prepare_initializer also rebuilds such cache entries.
+        self.views = [view for view in views
+                      if len(view.points) >= 12
+                      and _reference_view_arrays_are_aligned(
+                          view.points, view.descriptors, view.pixels)]
         # AKAZE remains the cheap first pass. SIFT is an adaptive fallback for
         # oblique/side views where low-texture or scale-changed AKAZE evidence
         # is insufficient. Both paths still require the same CAD/PnP gates.
@@ -228,7 +271,7 @@ class RgbGlobalInitializer:
         return RgbPoseSearch(self)
 
     def estimate(self, frame, box, temporal=None, validation_box=None, *,
-                 cross_family_support=False) -> RgbPose | None:
+                 cross_family_support=False, prior_pose=None) -> RgbPose | None:
         """Find a metric pose with adaptive current-frame feature evidence.
 
         AKAZE is tried first for speed. If it cannot produce a geometrically
@@ -324,8 +367,9 @@ class RgbGlobalInitializer:
                     old = unique.get(match.trainIdx)
                     if old is None or match.distance < old.distance:
                         unique[match.trainIdx] = match
-                current = {match.queryIdx: pixels_by_key[match.trainIdx].copy()
-                           for match in unique.values()}
+                current = {int(match.queryIdx): pixels_by_key[match.trainIdx].copy()
+                           for match in unique.values()
+                           if 0 <= int(match.queryIdx) < len(view.points)}
                 # Temporal evidence can outlive a reference-view rebuild
                 # during a live rotation. Drop stale descriptor indices before
                 # they reach PnP correspondence assembly; one stale index must
@@ -355,19 +399,32 @@ class RgbGlobalInitializer:
             candidates.sort(key=lambda entry: len(entry[1]), reverse=True)
             if bank is not None:
                 bank.remember(gray, box, evidence)
-            return solve_candidates([(view.name,
-                                      np.array([view.points[index] for index in matches]),
-                                      np.array(list(matches.values())))
-                                     for view, matches in candidates[:6]])
+            valid_candidates = []
+            for view, matches in candidates[:6]:
+                if not _reference_view_arrays_are_aligned(
+                        view.points, view.descriptors, view.pixels):
+                    continue
+                indices = [int(index) for index in matches
+                           if 0 <= int(index) < len(view.points)]
+                if len(indices) < 12:
+                    continue
+                valid_candidates.append((
+                    view.name,
+                    np.asarray([view.points[index] for index in indices]),
+                    np.asarray([matches[index] for index in indices])))
+            return solve_candidates(valid_candidates)
 
         def solve_candidates(candidates, *, min_inlier_ratio=.5):
             poses = []
             observed_axis = None
             for name, points, pixels in candidates:
+                method = (cv2.SOLVEPNP_ITERATIVE if prior_pose is not None
+                          else cv2.SOLVEPNP_EPNP)
                 pose = solve_correspondences(
                     points, pixels, self.K, self.dist, self.vertices, validation_box,
                     name, image_shape=frame.shape,
-                    min_inlier_ratio=min_inlier_ratio)
+                    min_inlier_ratio=min_inlier_ratio, pnp_method=method,
+                    prior_pose=prior_pose)
                 if pose is None:
                     continue
                 if validation_box is None:
@@ -498,8 +555,35 @@ class RgbGlobalInitializer:
                             previous.inlier_ratio, -previous.rms_px, len(previous.points)):
                         verified_by_reference[candidate.reference] = candidate
                 poses = list(verified_by_reference.values())
-            for pose in sorted(poses, key=lambda item: (
-                    -item.inlier_ratio, item.rms_px, -len(item.points))):
+            def pose_key(item):
+                # Once a track exists, continuity is stronger evidence than a
+                # tiny RMS advantage.  The old key preferred whichever PnP
+                # branch happened to have the lower residual, which is exactly
+                # how the 180-degree branch won on frame 821 in the recorded
+                # session.
+                if prior_pose is None:
+                    return (0., -item.inlier_ratio, item.rms_px, -len(item.points))
+                previous_axis = project_points(CONTROL_POINTS, prior_pose.rvec,
+                                               prior_pose.tvec, self.K, self.dist)
+                current_axis = project_points(CONTROL_POINTS, item.rvec,
+                                              item.tvec, self.K, self.dist)
+                old_vector = previous_axis[1] - previous_axis[0]
+                new_vector = current_axis[1] - current_axis[0]
+                old_length = np.linalg.norm(old_vector)
+                new_length = np.linalg.norm(new_vector)
+                if old_length < 20. or new_length < 20.:
+                    directed_jump = 0.
+                else:
+                    cosine = np.clip(np.dot(old_vector, new_vector) /
+                                     (old_length * new_length), -1., 1.)
+                    directed_jump = float(np.degrees(np.arccos(cosine)))
+                old_center = previous_axis[0]
+                new_center = current_axis[0]
+                center_jump = float(np.linalg.norm(new_center - old_center))
+                return (directed_jump, center_jump, -item.inlier_ratio,
+                        item.rms_px, -len(item.points))
+
+            for pose in sorted(poses, key=pose_key):
                 # Repeated rails sometimes give a well-fitting but shifted PnP.
                 # Small match sets need a second reference agreeing on metric
                 # center and undirected long axis; equivalent roll is ignored.
@@ -606,10 +690,11 @@ class RgbPoseSearch(RgbFeatureEvidence):
         self.sift_evidence.clear()
         self.orb_evidence.clear()
 
-    def estimate(self, frame, box, validation_box=None):
+    def estimate(self, frame, box, validation_box=None, prior_pose=None):
         options = dict(cross_family_support=True) if self.cross_family_support else {}
         return self.initializer.estimate(frame, box, temporal=self,
-                                         validation_box=validation_box, **options)
+                                         validation_box=validation_box,
+                                         prior_pose=prior_pose, **options)
 
 
 def verified_reference_paths(root: Path, *, pattern='*/attempt_*/rgb_initial_pose.json',
@@ -701,7 +786,8 @@ def prepare_initializer(model: Path, intrinsics: Path,
                                 points = stored['points'].copy()
                                 descriptors = stored['descriptors'].copy()
                                 pixels = stored['pixels'].copy()
-                                cached = True
+                                cached = _reference_view_arrays_are_aligned(
+                                    points, descriptors, pixels)
                     except (OSError, ValueError, KeyError):
                         cached = False
                 if not cached:
@@ -733,7 +819,8 @@ def prepare_initializer(model: Path, intrinsics: Path,
                                                    pixels[valid])
                     np.savez_compressed(cache_path, points=points,
                                         descriptors=descriptors, pixels=pixels)
-                if len(points) >= 12:
+                if (len(points) >= 12
+                        and _reference_view_arrays_are_aligned(points, descriptors, pixels)):
                     views.append(ReferenceView(str(path.resolve()), points, descriptors,
                                                kind, image_id, pixels))
         except (OSError, ValueError, KeyError, RuntimeError, cv2.error):
@@ -741,55 +828,68 @@ def prepare_initializer(model: Path, intrinsics: Path,
     return RgbGlobalInitializer(K, dist, vertices, views)
 
 
-def advance_pose(pose: RgbPose, source, current, K, dist, vertices, box, *, retry_pnp=False):
-    """Track matched pixels to the newest UI frame before handing off to RGB."""
+def advance_pose(pose: RgbPose, source, current, K, dist, vertices, box, *,
+                 retry_pnp=False, prior_pose=None):
+    """Track matched pixels to the newest frame with a temporal PnP prior."""
     started = time.perf_counter()
     first = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
     second = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
     pixels = pose.pixels.reshape(-1, 1, 2)
-    forward, valid, _ = cv2.calcOpticalFlowPyrLK(first, second, pixels, None,
-                                              winSize=(31, 31), maxLevel=3)
-    if forward is None or valid is None:
-        return None
-    backward, back_valid, _ = cv2.calcOpticalFlowPyrLK(second, first, forward, None,
-                                                     winSize=(31, 31), maxLevel=3)
-    if backward is None or back_valid is None:
-        return None
-    good = (valid.ravel().astype(bool) & back_valid.ravel().astype(bool)
-            & (np.linalg.norm(backward - pixels, axis=2).ravel() <= 1.))
     height, width = current.shape[:2]
-    good &= (np.all(forward[:, 0] >= [0, 0], axis=1) &
-             np.all(forward[:, 0] < [width, height], axis=1))
-    if np.count_nonzero(good) < 12:
+    forward = good = None
+    for win_size, max_level, fb_limit in (
+            ((31, 31), 3, 1.),
+            ((41, 41), 4, 1.5)):
+        candidate_forward, valid, _ = cv2.calcOpticalFlowPyrLK(
+            first, second, pixels, None, winSize=win_size, maxLevel=max_level)
+        if candidate_forward is None or valid is None:
+            continue
+        backward, back_valid, _ = cv2.calcOpticalFlowPyrLK(
+            second, first, candidate_forward, None,
+            winSize=win_size, maxLevel=max_level)
+        if backward is None or back_valid is None:
+            continue
+        candidate_good = (valid.ravel().astype(bool) & back_valid.ravel().astype(bool)
+                          & (np.linalg.norm(backward - pixels, axis=2).ravel()
+                             <= fb_limit))
+        candidate_good &= (np.all(candidate_forward[:, 0] >= [0, 0], axis=1) &
+                           np.all(candidate_forward[:, 0] < [width, height], axis=1))
+        if np.count_nonzero(candidate_good) < 12:
+            continue
+        forward, good = candidate_forward, candidate_good
+        break
+    if forward is None or good is None:
         return None
     # The detector box belongs to source; move it with the measured features
     # for geometric validation. With detector-free global search there is no
     # box to advance, and the independent PnP/CAD gates remain authoritative.
+    motion_shift = np.median(forward[good, 0] - pixels[good, 0], axis=0).astype(np.float32)
     current_box = None
     if box is not None:
-        shift = np.median(forward[good, 0] - pixels[good, 0], axis=0)
-        current_box = np.asarray(box) + np.tile(shift, 2)
+        current_box = np.asarray(box) + np.tile(motion_shift, 2)
     arguments = (pose.points[good], forward[good, 0], K, dist, vertices,
                  current_box, pose.reference)
-    method = cv2.SOLVEPNP_EPNP
-    if retry_pnp:
-        singular = np.linalg.svd(pose.points[good] - pose.points[good].mean(0),
-                                 compute_uv=False)
-        if singular[2] <= .05 * singular[1]:
-            # EPNP can choose the opposite-tilt branch on a nearly planar
-            # visible surface. ITERATIVE initializes planar geometry from the
-            # current correspondences; it does NOT inherit the old pose.
-            method = cv2.SOLVEPNP_ITERATIVE
-    current_pose = solve_correspondences(*arguments, image_shape=current.shape,
-                                         pnp_method=method, refine_inliers=False)
-    if current_pose is None and retry_pnp and method != cv2.SOLVEPNP_ITERATIVE:
-        current_pose = solve_correspondences(*arguments, image_shape=current.shape,
-                                             pnp_method=cv2.SOLVEPNP_ITERATIVE,
-                                             refine_inliers=False)
+    # Temporal updates are the high-rate tracking path. They must stay in the
+    # basin of the previous measured pose; otherwise EPNP/RANSAC can select the
+    # geometrically equivalent 180-degree branch even with sub-pixel residuals.
+    # ITERATIVE is useful here only when it receives the previous pose as its
+    # extrinsic guess.
+    prior_pose = pose if prior_pose is None else prior_pose
+    method = cv2.SOLVEPNP_ITERATIVE if prior_pose is not None else cv2.SOLVEPNP_EPNP
+    current_pose = solve_correspondences(
+        *arguments, image_shape=current.shape, pnp_method=method,
+        prior_pose=prior_pose, refine_inliers=False)
+    if current_pose is None and prior_pose is not None:
+        # Keep a measured fallback for difficult blur/occlusion frames. The
+        # caller still applies long-axis and box-motion gates before accepting
+        # this branch.
+        current_pose = solve_correspondences(
+            *arguments, image_shape=current.shape, pnp_method=cv2.SOLVEPNP_EPNP,
+            refine_inliers=False)
     if current_pose is None:
         return None
     return RgbPose(current_pose.rvec, current_pose.tvec, current_pose.points,
                    current_pose.pixels, current_pose.reference, current_pose.rms_px,
                    current_pose.inlier_ratio,
                    pose.elapsed_ms + (time.perf_counter() - started) * 1000.,
-                   pose.reference_support)
+                   pose.reference_support, motion_shift)

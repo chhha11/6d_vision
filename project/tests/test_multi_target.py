@@ -295,3 +295,31 @@ class MultiTargetRuntimeTest(unittest.TestCase):
             with self.subTest(flags=flags), self.assertRaises(SystemExit), \
                     patch('sys.stderr'):
                 live.parse_args(flags)
+
+class BoxStateAndFusionTest(unittest.TestCase):
+    def test_detector_measurement_is_kept_separate_from_filtered_box(self):
+        frame = np.zeros((240, 320, 3), np.uint8)
+        first = np.array([40., 40., 100., 120.], np.float32)
+        second = first + [4., 0., 4., 0.]
+        tracker = TargetSet()
+        target = tracker.update(frame, [first], 0.)[0]
+        with patch('core.multi_target_live.advance_box', return_value=first.copy()):
+            target = tracker.update(frame, [second], .1)[0]
+        np.testing.assert_array_equal(target.raw_detection_box, second)
+        self.assertEqual(target.box_source, 'filtered_detection')
+        self.assertGreater(target.box[0], first[0])
+        self.assertLess(target.box[0], second[0])
+        np.testing.assert_array_equal(target.predicted_box, first)
+
+    def test_view_fusion_averages_same_object_boxes(self):
+        from core.multi_target_detection import fuse_view_candidates
+        candidates = [(.9, [40., 50., 140., 180.]),
+                      (.8, [44., 51., 144., 181.])]
+        fused = fuse_view_candidates(candidates)
+        self.assertEqual(len(fused), 1)
+        self.assertGreater(fused[0][1][0], 40.)
+        self.assertLess(fused[0][1][0], 44.)
+
+
+if __name__ == '__main__':
+    unittest.main()
